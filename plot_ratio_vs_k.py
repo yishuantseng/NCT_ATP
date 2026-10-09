@@ -34,11 +34,25 @@ y-axis metrics (x-axis is always the normalised ATP/ADP ratio)
     rate_vs_ratio   median (1-b)*k, using only fits with R-sq > 0.8.
                     "1-b" is the column in the kinetics file (= |1-b|).
 
+Import vs export (kinetics / NCT folders only, no imaging)
+----------------
+x = export reporter 111, y = import reporter 110, one point per condition,
+for k and for (1-b)*k. Uses every condition measured by both reporters.
+
+Error bars
+----------
+Every graph is drawn twice:
+    _iqr    interquartile range (25th-75th percentile) of the cells
+    _ci95   95% bootstrap confidence interval of the median
+            (5000 resamples, fixed seed, so reruns give the same result)
+
 Output (--out-dir, default ./output)
 ------
-    <metric>/<metric>_<ratio>_all.png            all pairs and reporters
-    <metric>/<metric>_<ratio>_reporter<id>.png   one reporter, all pairs
-    <metric>/<metric>_<ratio>_<batch>.png        one pair, both reporters
+    <metric>/<metric>_<ratio>_all_<err>.png            all pairs and reporters
+    <metric>/<metric>_<ratio>_reporter<id>_<err>.png   one reporter, all pairs
+    <metric>/<metric>_<ratio>_<batch>_<err>.png        one pair, both reporters
+    import_vs_export/import_vs_export_<k|rate>_<all|batch>_<err>.png
+    import_vs_export/import_vs_export_summary.csv
     ratio_vs_k_summary.csv             medians, IQRs and n per condition
     imaging_normalised_<batch>.csv     per-cell ratios incl. normalised columns
 
@@ -55,6 +69,7 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 PAIRS_FILE = "folder_pairs.csv"
@@ -77,6 +92,15 @@ SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
 RSQ_THRESHOLD = 0.8
 RATE_COL = f"(1-b)*k_Rsq>{RSQ_THRESHOLD}"
 BATCH_MARKERS = ["o", "s", "^", "D", "v", "P"]
+IMPORT_REPORTER = "110"
+EXPORT_REPORTER = "111"
+N_BOOT = 5000
+BOOT_SEED = 0
+# Error-bar styles: name -> (low suffix, high suffix, footnote text).
+ERROR_BARS = {
+    "iqr": ("q25", "q75", "bars: interquartile range (25th-75th percentile)"),
+    "ci95": ("ci_lo", "ci_hi", "bars: 95% bootstrap confidence interval of the median"),
+}
 
 
 # ---------------------------------------------------------------- pairing
@@ -200,9 +224,29 @@ def q75(s):
     return s.quantile(0.75)
 
 
+def bootstrap_median_ci(values, n_boot=N_BOOT, level=0.95, seed=BOOT_SEED):
+    """Percentile bootstrap confidence interval of the median."""
+    values = np.asarray(values, dtype=float)
+    if len(values) < 2:
+        return np.nan, np.nan
+    rng = np.random.default_rng(seed)
+    medians = np.median(rng.choice(values, size=(n_boot, len(values))), axis=1)
+    alpha = (1 - level) / 2
+    return tuple(np.quantile(medians, [alpha, 1 - alpha]))
+
+
+def ci_lo(s):
+    return bootstrap_median_ci(s)[0]
+
+
+def ci_hi(s):
+    return bootstrap_median_ci(s)[1]
+
+
 def summarise(df, value_col, prefix):
-    g = df.groupby(GROUP_COLS, dropna=False)[value_col].agg(["median", q25, q75, "count"])
-    g.columns = [f"{prefix}_{c}" for c in ["median", "q25", "q75", "n"]]
+    stats = ["median", q25, q75, ci_lo, ci_hi, "count"]
+    g = df.groupby(GROUP_COLS, dropna=False)[value_col].agg(stats)
+    g.columns = [f"{prefix}_{c}" for c in ["median", "q25", "q75", "ci_lo", "ci_hi", "n"]]
     return g
 
 
@@ -250,16 +294,12 @@ def series_styles(summary):
             for i, key in enumerate(keys)}
 
 
-def plot_summary(summary, y_prefix, ratio_col, y_label, title, out_png, styles):
+def plot_summary(summary, y_prefix, ratio_col, y_label, title, out_png, styles, err):
     """One point per (batch, reporter, condition).
 
     x = normalised ATP/ADP ratio, y = the kinetics metric named by y_prefix.
     """
-    fig, ax = plt.subplots(figsize=(8, 6))
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
-    ax.grid(True, color="#e6e6e6", linewidth=0.8)
-    ax.set_axisbelow(True)
+    fig, ax = new_axes()
     ax.axvline(1, color="#999999", linewidth=1, linestyle="--", zorder=1)
 
     for (batch, reporter), sub in summary.groupby(["batch", "reporter"], sort=False):
@@ -267,8 +307,9 @@ def plot_summary(summary, y_prefix, ratio_col, y_label, title, out_png, styles):
         sub = sub.sort_values("treatment", key=lambda s: s.map(dose_key))
         color, marker = styles[(batch, reporter)]
         x, y = sub["ratio_norm_median"], sub[f"{y_prefix}_median"]
-        xerr = [x - sub["ratio_norm_q25"], sub["ratio_norm_q75"] - x]
-        yerr = [y - sub[f"{y_prefix}_q25"], sub[f"{y_prefix}_q75"] - y]
+        lo, hi, _ = ERROR_BARS[err]
+        xerr = [x - sub[f"ratio_norm_{lo}"], sub[f"ratio_norm_{hi}"] - x]
+        yerr = [y - sub[f"{y_prefix}_{lo}"], sub[f"{y_prefix}_{hi}"] - y]
         ax.errorbar(x, y, xerr=xerr, yerr=yerr,
                     fmt="none", ecolor=color, elinewidth=1, alpha=0.35, capsize=0)
         ax.plot(x, y, color=color, linewidth=1, alpha=0.5, zorder=2)
@@ -284,9 +325,21 @@ def plot_summary(summary, y_prefix, ratio_col, y_label, title, out_png, styles):
     ax.set_ylabel(y_label)
     ax.set_title(title, fontsize=11, loc="left")
     ax.legend(frameon=False, fontsize=8)
-    fig.text(0.01, 0.01, "points: median per condition (labels = 2DG dose); "
-             "bars: interquartile range; dashed line: control ratio = 1",
-             fontsize=7, color="#777777")
+    finish(fig, "points: median per condition (labels = 2DG dose); "
+           f"{ERROR_BARS[err][2]}; dashed line: control ratio = 1", out_png)
+
+
+def new_axes():
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.grid(True, color="#e6e6e6", linewidth=0.8)
+    ax.set_axisbelow(True)
+    return fig, ax
+
+
+def finish(fig, footnote, out_png):
+    fig.text(0.01, 0.01, footnote, fontsize=7, color="#777777")
     fig.tight_layout(rect=(0, 0.02, 1, 1))
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
@@ -308,14 +361,96 @@ def plot_all(combined, ratio_name, y_metrics, out_dir):
         sub_dir = out_dir / folder
         sub_dir.mkdir(parents=True, exist_ok=True)
         for scope, title, data in scopes:
-            out_png = sub_dir / f"{folder}_{ratio_name}_{scope}.png"
-            plot_summary(data, y_prefix, ratio_col, y_label, title, out_png, styles)
-            print(f"saved {out_png}")
+            for err in ERROR_BARS:
+                out_png = sub_dir / f"{folder}_{ratio_name}_{scope}_{err}.png"
+                plot_summary(data, y_prefix, ratio_col, y_label, title, out_png,
+                             styles, err)
+                print(f"saved {out_png}")
+
+
+# ------------------------------------------------- import vs export (NCT only)
+def summarise_kinetics(kinetics, y_cols):
+    """Per-condition summary of each kinetics metric, one row per reporter."""
+    rows = []
+    for reporter, kdf in kinetics.groupby("reporter"):
+        kin = pd.concat([summarise(kdf.dropna(subset=[col]), col, prefix)
+                         for prefix, col in y_cols.items()], axis=1).reset_index()
+        kin.insert(0, "reporter", reporter)
+        rows.append(kin)
+    return pd.concat(rows, ignore_index=True)
+
+
+def import_export_table(kin_summary, y_cols):
+    """Wide table: one row per (batch, condition), export (111) and import (110)
+    columns side by side. Only conditions measured by both reporters are kept."""
+    keys = ["batch"] + GROUP_COLS
+    stat_cols = [c for c in kin_summary.columns
+                 if any(c.startswith(f"{p}_") for p in y_cols)]
+    exp = kin_summary[kin_summary["reporter"] == EXPORT_REPORTER][keys + stat_cols]
+    imp = kin_summary[kin_summary["reporter"] == IMPORT_REPORTER][keys + stat_cols]
+    wide = exp.merge(imp, on=keys, suffixes=("_export", "_import"))
+    wide.insert(1, "condition", wide[GROUP_COLS].astype(str).agg("_".join, axis=1))
+    wide["_dose"] = wide["treatment"].map(dose_key)
+    return wide.sort_values(["batch", "cell_type", "_dose"]).drop(columns="_dose")
+
+
+def plot_import_export(wide, y_prefix, metric_label, title, out_png, styles, err):
+    """x = export reporter (111), y = import reporter (110); one point per condition."""
+    fig, ax = new_axes()
+    lo, hi, err_text = ERROR_BARS[err]
+    for batch, sub in wide.groupby("batch", sort=False):
+        xc, yc = f"{y_prefix}_median_export", f"{y_prefix}_median_import"
+        sub = sub.dropna(subset=[xc, yc])
+        color, marker = styles[batch]
+        x, y = sub[xc], sub[yc]
+        xerr = [x - sub[f"{y_prefix}_{lo}_export"], sub[f"{y_prefix}_{hi}_export"] - x]
+        yerr = [y - sub[f"{y_prefix}_{lo}_import"], sub[f"{y_prefix}_{hi}_import"] - y]
+        ax.errorbar(x, y, xerr=xerr, yerr=yerr,
+                    fmt="none", ecolor=color, elinewidth=1, alpha=0.35, capsize=0)
+        ax.plot(x, y, color=color, linewidth=1, alpha=0.5, zorder=2)
+        ax.scatter(x, y, s=64, color=color, marker=marker, edgecolor="white",
+                   linewidth=1.5, zorder=3, label=batch)
+        for xi, yi, t in zip(x, y, sub["treatment"]):
+            ax.annotate(str(t).replace(" 2DG", ""), (xi, yi),
+                        xytext=(5, 4), textcoords="offset points",
+                        fontsize=7, color="#555555")
+    ax.set_xlabel(f"export: reporter {EXPORT_REPORTER}, median {metric_label}")
+    ax.set_ylabel(f"import: reporter {IMPORT_REPORTER}, median {metric_label}")
+    ax.set_title(title, fontsize=11, loc="left")
+    ax.legend(frameon=False, fontsize=8)
+    finish(fig, f"points: median per condition (labels = 2DG dose); {err_text}", out_png)
+
+
+def plot_all_import_export(kin_summary, y_cols, out_dir):
+    wide = import_export_table(kin_summary, y_cols)
+    if wide.empty:
+        print(f"no conditions with both reporters {IMPORT_REPORTER} and "
+              f"{EXPORT_REPORTER}; skipping import vs export graphs")
+        return
+    batches = list(dict.fromkeys(wide["batch"]))
+    styles = {b: (SERIES_COLORS[i % len(SERIES_COLORS)],
+                  BATCH_MARKERS[i % len(BATCH_MARKERS)]) for i, b in enumerate(batches)}
+    labels = {"k": y_cols["k"], "rate": f"(1-b)*k (R-sq > {RSQ_THRESHOLD})"}
+    folder = "import_vs_export"
+    sub_dir = out_dir / folder
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    scopes = [("all", f"All batches: {', '.join(batches)}", wide)]
+    scopes += [(b, b, sub) for b, sub in wide.groupby("batch", sort=False)]
+    for y_prefix in y_cols:
+        for scope, title, data in scopes:
+            for err in ERROR_BARS:
+                out_png = sub_dir / f"{folder}_{y_prefix}_{scope}_{err}.png"
+                plot_import_export(data, y_prefix, labels[y_prefix], title,
+                                   out_png, styles, err)
+                print(f"saved {out_png}")
+    out_csv = sub_dir / "import_vs_export_summary.csv"
+    wide.to_csv(out_csv, index=False)
+    print(f"saved {out_csv}")
 
 
 # ---------------------------------------------------------------- main
 def process_batch(batch, folders, ratios, y_cols, out_dir):
-    """Return {ratio name: summary DataFrame} for one imaging/kinetics pair."""
+    """Return ({ratio name: summary DataFrame}, kinetics summary) for one pair."""
     pair = (f"{', '.join(f.name for f in folders['imaging'])} + "
             f"{', '.join(f.name for f in folders['kinetics'])}")
     print(f"Batch {batch}: {pair}")
@@ -346,7 +481,9 @@ def process_batch(batch, folders, ratios, y_cols, out_dir):
     out_csv = out_dir / f"imaging_normalised_{batch}.csv"
     imaging[[c for c in keep if c in imaging.columns]].to_csv(out_csv, index=False)
     print(f"  saved {out_csv}")
-    return results
+    kin_summary = summarise_kinetics(kinetics, y_cols)
+    kin_summary.insert(0, "batch", batch)
+    return results, kin_summary
 
 
 def main():
@@ -391,10 +528,14 @@ def main():
     }
 
     per_ratio = {name: [] for name in ratios}
+    kin_summaries = []
     for batch, folders in batches.items():
-        for name, summary in process_batch(batch, folders, ratios, y_cols,
-                                           out_dir).items():
+        results, kin_summary = process_batch(batch, folders, ratios, y_cols, out_dir)
+        kin_summaries.append(kin_summary)
+        for name, summary in results.items():
             per_ratio[name].append(summary)
+
+    plot_all_import_export(pd.concat(kin_summaries, ignore_index=True), y_cols, out_dir)
 
     all_summaries = []
     for name, summaries in per_ratio.items():
