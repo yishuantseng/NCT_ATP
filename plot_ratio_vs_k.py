@@ -1,5 +1,5 @@
 """Pair imaging and kinetics experiments from the same cell batch and plot
-the normalised 488/405 ATP/ADP ratio against the fitted rate constant.
+the fitted rate constant against the normalised 488/405 ATP/ADP ratio.
 
 Folder pairing
 --------------
@@ -30,8 +30,8 @@ The rate constant k is not normalised.
 
 Output (--out-dir, default ./output)
 ------
-    ratio_vs_k_<ratio>_all.png         all pairs on one graph
-    ratio_vs_k_<ratio>_<batch>.png     one graph per pair
+    k_vs_ratio_<ratio>_all.png         all pairs on one graph
+    k_vs_ratio_<ratio>_<batch>.png     one graph per pair
     ratio_vs_k_summary.csv             medians, IQRs and n per condition
     imaging_normalised_<batch>.csv     per-cell ratios incl. normalised columns
 
@@ -222,13 +222,16 @@ def build_summary(imaging, kinetics, ratio_col, norm_col, k_col):
 
 # ---------------------------------------------------------------- plotting
 def plot_summary(summary, ratio_col, k_col, title, out_png):
-    """One point per (batch, reporter, condition); colour = batch x reporter."""
+    """One point per (batch, reporter, condition); colour = batch x reporter.
+
+    x = normalised ATP/ADP ratio, y = rate constant k.
+    """
     fig, ax = plt.subplots(figsize=(8, 6))
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     ax.grid(True, color="#e6e6e6", linewidth=0.8)
     ax.set_axisbelow(True)
-    ax.axhline(1, color="#999999", linewidth=1, linestyle="--", zorder=1)
+    ax.axvline(1, color="#999999", linewidth=1, linestyle="--", zorder=1)
 
     batches = list(dict.fromkeys(summary["batch"]))
     series = summary.groupby(["batch", "reporter"], sort=False)
@@ -236,28 +239,27 @@ def plot_summary(summary, ratio_col, k_col, title, out_png):
         sub = sub.sort_values("treatment", key=lambda s: s.map(dose_key))
         color = SERIES_COLORS[i % len(SERIES_COLORS)]
         marker = BATCH_MARKERS[batches.index(batch) % len(BATCH_MARKERS)]
-        xerr = [sub["k_median"] - sub["k_q25"], sub["k_q75"] - sub["k_median"]]
-        yerr = [sub["ratio_norm_median"] - sub["ratio_norm_q25"],
-                sub["ratio_norm_q75"] - sub["ratio_norm_median"]]
-        ax.errorbar(sub["k_median"], sub["ratio_norm_median"], xerr=xerr, yerr=yerr,
+        x, y = sub["ratio_norm_median"], sub["k_median"]
+        xerr = [x - sub["ratio_norm_q25"], sub["ratio_norm_q75"] - x]
+        yerr = [y - sub["k_q25"], sub["k_q75"] - y]
+        ax.errorbar(x, y, xerr=xerr, yerr=yerr,
                     fmt="none", ecolor=color, elinewidth=1, alpha=0.35, capsize=0)
-        ax.plot(sub["k_median"], sub["ratio_norm_median"], color=color,
-                linewidth=1, alpha=0.5, zorder=2)
-        ax.scatter(sub["k_median"], sub["ratio_norm_median"], s=64, color=color,
+        ax.plot(x, y, color=color, linewidth=1, alpha=0.5, zorder=2)
+        ax.scatter(x, y, s=64, color=color,
                    marker=marker, edgecolor="white", linewidth=1.5, zorder=3,
                    label=f"{batch} · reporter {reporter}")
         for _, r in sub.iterrows():
             ax.annotate(r["treatment"].replace(" 2DG", ""),
-                        (r["k_median"], r["ratio_norm_median"]),
+                        (r["ratio_norm_median"], r["k_median"]),
                         xytext=(5, 4), textcoords="offset points",
                         fontsize=7, color="#555555")
 
-    ax.set_xlabel(f"median {k_col}")
-    ax.set_ylabel(f"median {ratio_col}\nnormalised to {CONTROL_TREATMENT} median")
+    ax.set_xlabel(f"median {ratio_col}\nnormalised to {CONTROL_TREATMENT} median")
+    ax.set_ylabel(f"median {k_col}")
     ax.set_title(title, fontsize=11, loc="left")
     ax.legend(frameon=False, fontsize=8)
     fig.text(0.01, 0.01, "points: median per condition (labels = 2DG dose); "
-             "bars: interquartile range; dashed line: control = 1",
+             "bars: interquartile range; dashed line: control ratio = 1",
              fontsize=7, color="#777777")
     fig.tight_layout(rect=(0, 0.02, 1, 1))
     fig.savefig(out_png, dpi=200)
@@ -289,7 +291,7 @@ def process_batch(batch, folders, ratios, k_col, out_dir):
         summary.insert(0, "batch", batch)
         summary.insert(1, "pair", pair)
         results[name] = summary
-        out_png = out_dir / f"ratio_vs_k_{name}_{batch}.png"
+        out_png = out_dir / f"k_vs_ratio_{name}_{batch}.png"
         plot_summary(summary, ratio_col, k_col, f"{batch}: {pair}", out_png)
         print(f"  saved {out_png}")
 
@@ -347,7 +349,7 @@ def main():
             continue
         combined = pd.concat(summaries, ignore_index=True)
         all_summaries.append(combined)
-        out_png = out_dir / f"ratio_vs_k_{name}_all.png"
+        out_png = out_dir / f"k_vs_ratio_{name}_all.png"
         plot_summary(combined, RATIO_COLS[name], args.k_col,
                      f"All pairs: {', '.join(batches)}", out_png)
         print(f"saved {out_png}")
