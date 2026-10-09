@@ -26,12 +26,19 @@ Normalisation
 -------------
 Within each batch and cell type, every cell's ATP/ADP ratio is divided by
 the median ratio of the 0mM 2DG control, so the control median is 1.
-The rate constant k is not normalised.
+The kinetics values are not normalised.
+
+y-axis metrics (x-axis is always the normalised ATP/ADP ratio)
+--------------
+    k_vs_ratio      median adj_k_0.80_cond (--k-col)
+    rate_vs_ratio   median (1-b)*k, using only fits with R-sq > 0.8.
+                    "1-b" is the column in the kinetics file (= |1-b|).
 
 Output (--out-dir, default ./output)
 ------
-    k_vs_ratio_<ratio>_all.png         all pairs on one graph
-    k_vs_ratio_<ratio>_<batch>.png     one graph per pair
+    <metric>/<metric>_<ratio>_all.png            all pairs and reporters
+    <metric>/<metric>_<ratio>_reporter<id>.png   one reporter, all pairs
+    <metric>/<metric>_<ratio>_<batch>.png        one pair, both reporters
     ratio_vs_k_summary.csv             medians, IQRs and n per condition
     imaging_normalised_<batch>.csv     per-cell ratios incl. normalised columns
 
@@ -67,6 +74,8 @@ FOLDER_RE = re.compile(r"^(?P<batch>\d{8}_[^_]+)_(?P<ids>[\d,]+)$")
 # Categorical slots 1..8 (fixed order, never cycled).
 SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
                  "#e87ba4", "#008300", "#8a5cd6", "#6b6b6b"]
+RSQ_THRESHOLD = 0.8
+RATE_COL = f"(1-b)*k_Rsq>{RSQ_THRESHOLD}"
 BATCH_MARKERS = ["o", "s", "^", "D", "v", "P"]
 
 
@@ -161,6 +170,10 @@ def load_kinetics(path):
         df["reporter"] = m.group(1) if m else path.stem
     df["reporter"] = df["reporter"].astype(str)
     df["source"] = path.name
+    # Rate = (1-b)*k, kept only for fits with R-sq above the threshold.
+    # The file's "1-b" column holds |1-b|; fall back to computing it.
+    one_minus_b = df["1-b"] if "1-b" in df.columns else (1 - df["b"]).abs()
+    df[RATE_COL] = (one_minus_b * df["k"]).where(df["R-sq"] > RSQ_THRESHOLD)
     return fill_cell_type(df)
 
 
@@ -198,13 +211,18 @@ def dose_key(treatment):
     return float(m.group(1)) if m else float("inf")
 
 
-def build_summary(imaging, kinetics, ratio_col, norm_col, k_col):
+def build_summary(imaging, kinetics, ratio_col, norm_col, y_cols):
+    """Join per-condition imaging medians with kinetics medians.
+
+    y_cols maps a prefix used in the output columns to a kinetics column.
+    """
     img = summarise(imaging.dropna(subset=[norm_col]), norm_col, "ratio_norm")
     raw = summarise(imaging.dropna(subset=[ratio_col]), ratio_col, "ratio_raw")
     img = img.join(raw[["ratio_raw_median"]])
     rows = []
     for reporter, kdf in kinetics.groupby("reporter"):
-        kin = summarise(kdf.dropna(subset=[k_col]), k_col, "k")
+        kin = pd.concat([summarise(kdf.dropna(subset=[col]), col, prefix)
+                         for prefix, col in y_cols.items()], axis=1)
         merged = img.join(kin, how="inner").reset_index()
         merged.insert(0, "reporter", reporter)
         rows.append(merged)
@@ -215,16 +233,27 @@ def build_summary(imaging, kinetics, ratio_col, norm_col, k_col):
     out = pd.concat(rows, ignore_index=True)
     out.insert(1, "condition", out[GROUP_COLS].astype(str).agg("_".join, axis=1))
     out["ratio_col"] = ratio_col
-    out["k_col"] = k_col
+    for prefix, col in y_cols.items():
+        out[f"{prefix}_col"] = col
     out["_dose"] = out["treatment"].map(dose_key)
     return out.sort_values(["reporter", "cell_type", "_dose"]).drop(columns="_dose")
 
 
 # ---------------------------------------------------------------- plotting
-def plot_summary(summary, ratio_col, k_col, title, out_png):
-    """One point per (batch, reporter, condition); colour = batch x reporter.
+def series_styles(summary):
+    """Fixed colour per (batch, reporter) and marker per batch, so a series
+    looks the same in every graph."""
+    batches = list(dict.fromkeys(summary["batch"]))
+    keys = list(dict.fromkeys(zip(summary["batch"], summary["reporter"])))
+    return {key: (SERIES_COLORS[i % len(SERIES_COLORS)],
+                  BATCH_MARKERS[batches.index(key[0]) % len(BATCH_MARKERS)])
+            for i, key in enumerate(keys)}
 
-    x = normalised ATP/ADP ratio, y = rate constant k.
+
+def plot_summary(summary, y_prefix, ratio_col, y_label, title, out_png, styles):
+    """One point per (batch, reporter, condition).
+
+    x = normalised ATP/ADP ratio, y = the kinetics metric named by y_prefix.
     """
     fig, ax = plt.subplots(figsize=(8, 6))
     for spine in ("top", "right"):
@@ -233,29 +262,26 @@ def plot_summary(summary, ratio_col, k_col, title, out_png):
     ax.set_axisbelow(True)
     ax.axvline(1, color="#999999", linewidth=1, linestyle="--", zorder=1)
 
-    batches = list(dict.fromkeys(summary["batch"]))
-    series = summary.groupby(["batch", "reporter"], sort=False)
-    for i, ((batch, reporter), sub) in enumerate(series):
+    for (batch, reporter), sub in summary.groupby(["batch", "reporter"], sort=False):
+        sub = sub.dropna(subset=[f"{y_prefix}_median"])
         sub = sub.sort_values("treatment", key=lambda s: s.map(dose_key))
-        color = SERIES_COLORS[i % len(SERIES_COLORS)]
-        marker = BATCH_MARKERS[batches.index(batch) % len(BATCH_MARKERS)]
-        x, y = sub["ratio_norm_median"], sub["k_median"]
+        color, marker = styles[(batch, reporter)]
+        x, y = sub["ratio_norm_median"], sub[f"{y_prefix}_median"]
         xerr = [x - sub["ratio_norm_q25"], sub["ratio_norm_q75"] - x]
-        yerr = [y - sub["k_q25"], sub["k_q75"] - y]
+        yerr = [y - sub[f"{y_prefix}_q25"], sub[f"{y_prefix}_q75"] - y]
         ax.errorbar(x, y, xerr=xerr, yerr=yerr,
                     fmt="none", ecolor=color, elinewidth=1, alpha=0.35, capsize=0)
         ax.plot(x, y, color=color, linewidth=1, alpha=0.5, zorder=2)
         ax.scatter(x, y, s=64, color=color,
                    marker=marker, edgecolor="white", linewidth=1.5, zorder=3,
                    label=f"{batch} · reporter {reporter}")
-        for _, r in sub.iterrows():
-            ax.annotate(r["treatment"].replace(" 2DG", ""),
-                        (r["ratio_norm_median"], r["k_median"]),
+        for xi, yi, t in zip(x, y, sub["treatment"]):
+            ax.annotate(str(t).replace(" 2DG", ""), (xi, yi),
                         xytext=(5, 4), textcoords="offset points",
                         fontsize=7, color="#555555")
 
     ax.set_xlabel(f"median {ratio_col}\nnormalised to {CONTROL_TREATMENT} median")
-    ax.set_ylabel(f"median {k_col}")
+    ax.set_ylabel(y_label)
     ax.set_title(title, fontsize=11, loc="left")
     ax.legend(frameon=False, fontsize=8)
     fig.text(0.01, 0.01, "points: median per condition (labels = 2DG dose); "
@@ -266,8 +292,29 @@ def plot_summary(summary, ratio_col, k_col, title, out_png):
     plt.close(fig)
 
 
+def plot_all(combined, ratio_name, y_metrics, out_dir):
+    """Write graphs for every pair together, each reporter, and each pair."""
+    styles = series_styles(combined)
+    ratio_col = RATIO_COLS[ratio_name]
+    batches = list(dict.fromkeys(combined["batch"]))
+    scopes = [("all", f"All pairs: {', '.join(batches)}", combined)]
+    for reporter, sub in combined.groupby("reporter"):
+        scopes.append((f"reporter{reporter}",
+                       f"Reporter {reporter}: {', '.join(batches)}", sub))
+    for batch, sub in combined.groupby("batch", sort=False):
+        scopes.append((batch, f"{batch}: {sub['pair'].iloc[0]}", sub))
+
+    for y_prefix, (folder, y_label) in y_metrics.items():
+        sub_dir = out_dir / folder
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        for scope, title, data in scopes:
+            out_png = sub_dir / f"{folder}_{ratio_name}_{scope}.png"
+            plot_summary(data, y_prefix, ratio_col, y_label, title, out_png, styles)
+            print(f"saved {out_png}")
+
+
 # ---------------------------------------------------------------- main
-def process_batch(batch, folders, ratios, k_col, out_dir):
+def process_batch(batch, folders, ratios, y_cols, out_dir):
     """Return {ratio name: summary DataFrame} for one imaging/kinetics pair."""
     pair = (f"{', '.join(f.name for f in folders['imaging'])} + "
             f"{', '.join(f.name for f in folders['kinetics'])}")
@@ -277,8 +324,9 @@ def process_batch(batch, folders, ratios, k_col, out_dir):
     for p in kin_files:
         print(f"  kinetics file: {p.parent.name}/{p.name}")
     kinetics = pd.concat([load_kinetics(p) for p in kin_files], ignore_index=True)
-    if k_col not in kinetics.columns:
-        raise SystemExit(f"Column {k_col!r} not found in kinetics files")
+    for col in y_cols.values():
+        if col not in kinetics.columns:
+            raise SystemExit(f"Column {col!r} not found in kinetics files")
 
     results = {}
     for name in ratios:
@@ -287,13 +335,10 @@ def process_batch(batch, folders, ratios, k_col, out_dir):
             print(f"  skipping {ratio_col}: not in imaging data")
             continue
         norm_col = normalise_to_control(imaging, ratio_col)
-        summary = build_summary(imaging, kinetics, ratio_col, norm_col, k_col)
+        summary = build_summary(imaging, kinetics, ratio_col, norm_col, y_cols)
         summary.insert(0, "batch", batch)
         summary.insert(1, "pair", pair)
         results[name] = summary
-        out_png = out_dir / f"k_vs_ratio_{name}_{batch}.png"
-        plot_summary(summary, ratio_col, k_col, f"{batch}: {pair}", out_png)
-        print(f"  saved {out_png}")
 
     norm_cols = [c for c in imaging.columns if c.endswith("_norm")]
     keep = ["source", "image_name", "cell_id", "treatment", "treat_time", "pyruvate",
@@ -337,9 +382,17 @@ def main():
     if not batches:
         raise SystemExit(f"No imaging/kinetics folder pairs found in {args.base_dir}")
 
+    # y-axis metrics: summary prefix -> kinetics column / (output folder, axis label)
+    y_cols = {"k": args.k_col, "rate": RATE_COL}
+    y_metrics = {
+        "k": ("k_vs_ratio", f"median {args.k_col}"),
+        "rate": ("rate_vs_ratio",
+                 f"median (1-b)*k\n(fits with R-sq > {RSQ_THRESHOLD} only)"),
+    }
+
     per_ratio = {name: [] for name in ratios}
     for batch, folders in batches.items():
-        for name, summary in process_batch(batch, folders, ratios, args.k_col,
+        for name, summary in process_batch(batch, folders, ratios, y_cols,
                                            out_dir).items():
             per_ratio[name].append(summary)
 
@@ -349,10 +402,7 @@ def main():
             continue
         combined = pd.concat(summaries, ignore_index=True)
         all_summaries.append(combined)
-        out_png = out_dir / f"k_vs_ratio_{name}_all.png"
-        plot_summary(combined, RATIO_COLS[name], args.k_col,
-                     f"All pairs: {', '.join(batches)}", out_png)
-        print(f"saved {out_png}")
+        plot_all(combined, name, y_metrics, out_dir)
 
     if all_summaries:
         out_csv = out_dir / "ratio_vs_k_summary.csv"
