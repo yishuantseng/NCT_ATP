@@ -37,7 +37,8 @@ y-axis metrics (x-axis is always the normalised ATP/ADP ratio)
 Import vs export (kinetics / NCT folders only, no imaging)
 ----------------
 x = export reporter 111, y = import reporter 110, one point per condition,
-for k and for (1-b)*k. Uses every condition measured by both reporters.
+for k and for (1-b)*k. Colour = treatment (light -> dark blue with dose),
+marker and line style = batch. Uses every condition measured by both reporters.
 
 Error bars
 ----------
@@ -69,6 +70,7 @@ import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 
@@ -92,6 +94,10 @@ SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
 RSQ_THRESHOLD = 0.8
 RATE_COL = f"(1-b)*k_Rsq>{RSQ_THRESHOLD}"
 BATCH_MARKERS = ["o", "s", "^", "D", "v", "P"]
+BATCH_LINESTYLES = ["-", "--", ":", "-."]
+# Sequential blue ramp (steps 250-700) for treatment dose, light -> dark.
+DOSE_RAMP = ["#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf",
+             "#1c5cab", "#184f95", "#104281", "#0d366b"]
 IMPORT_REPORTER = "110"
 EXPORT_REPORTER = "111"
 N_BOOT = 5000
@@ -394,31 +400,59 @@ def import_export_table(kin_summary, y_cols):
     return wide.sort_values(["batch", "cell_type", "_dose"]).drop(columns="_dose")
 
 
+def treatment_colors(treatments):
+    """Sequential blue ramp (light -> dark) by dose, so colour follows the
+    treatment and stays the same in every import vs export graph."""
+    ordered = sorted(set(treatments), key=dose_key)
+    n = len(ordered)
+    idx = [round(i * (len(DOSE_RAMP) - 1) / max(n - 1, 1)) for i in range(n)]
+    return {t: DOSE_RAMP[j] for t, j in zip(ordered, idx)}
+
+
 def plot_import_export(wide, y_prefix, metric_label, title, out_png, styles, err):
-    """x = export reporter (111), y = import reporter (110); one point per condition."""
+    """x = export reporter (111), y = import reporter (110); one point per condition.
+
+    Colour = treatment, marker / line style = batch.
+    """
+    colors, batch_styles = styles
     fig, ax = new_axes()
     lo, hi, err_text = ERROR_BARS[err]
+    xc, yc = f"{y_prefix}_median_export", f"{y_prefix}_median_import"
     for batch, sub in wide.groupby("batch", sort=False):
-        xc, yc = f"{y_prefix}_median_export", f"{y_prefix}_median_import"
         sub = sub.dropna(subset=[xc, yc])
-        color, marker = styles[batch]
-        x, y = sub[xc], sub[yc]
-        xerr = [x - sub[f"{y_prefix}_{lo}_export"], sub[f"{y_prefix}_{hi}_export"] - x]
-        yerr = [y - sub[f"{y_prefix}_{lo}_import"], sub[f"{y_prefix}_{hi}_import"] - y]
-        ax.errorbar(x, y, xerr=xerr, yerr=yerr,
-                    fmt="none", ecolor=color, elinewidth=1, alpha=0.35, capsize=0)
-        ax.plot(x, y, color=color, linewidth=1, alpha=0.5, zorder=2)
-        ax.scatter(x, y, s=64, color=color, marker=marker, edgecolor="white",
-                   linewidth=1.5, zorder=3, label=batch)
-        for xi, yi, t in zip(x, y, sub["treatment"]):
-            ax.annotate(str(t).replace(" 2DG", ""), (xi, yi),
+        sub = sub.sort_values("treatment", key=lambda s: s.map(dose_key))
+        marker, linestyle = batch_styles[batch]
+        ax.plot(sub[xc], sub[yc], color="#9a9a9a", linewidth=1, linestyle=linestyle,
+                alpha=0.7, zorder=2)
+        for _, r in sub.iterrows():
+            color = colors[r["treatment"]]
+            x, y = r[xc], r[yc]
+            ax.errorbar(x, y,
+                        xerr=[[x - r[f"{y_prefix}_{lo}_export"]],
+                              [r[f"{y_prefix}_{hi}_export"] - x]],
+                        yerr=[[y - r[f"{y_prefix}_{lo}_import"]],
+                              [r[f"{y_prefix}_{hi}_import"] - y]],
+                        fmt="none", ecolor=color, elinewidth=1, alpha=0.5, capsize=0)
+            ax.scatter(x, y, s=70, color=color, marker=marker, edgecolor="white",
+                       linewidth=1.5, zorder=3)
+            ax.annotate(str(r["treatment"]).replace(" 2DG", ""), (x, y),
                         xytext=(5, 4), textcoords="offset points",
                         fontsize=7, color="#555555")
+
+    present = sorted(set(wide["treatment"]), key=dose_key)
+    handles = [Line2D([], [], linestyle="", marker="o", markersize=8,
+                      markerfacecolor=colors[t], markeredgecolor="white", label=t)
+               for t in present]
+    handles += [Line2D([], [], color="#9a9a9a", linestyle=ls, marker=m, markersize=7,
+                       markerfacecolor="#9a9a9a", markeredgecolor="white", label=b)
+                for b, (m, ls) in batch_styles.items() if b in set(wide["batch"])]
+    ax.legend(handles=handles, frameon=False, fontsize=8,
+              loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
     ax.set_xlabel(f"export: reporter {EXPORT_REPORTER}, median {metric_label}")
     ax.set_ylabel(f"import: reporter {IMPORT_REPORTER}, median {metric_label}")
     ax.set_title(title, fontsize=11, loc="left")
-    ax.legend(frameon=False, fontsize=8)
-    finish(fig, f"points: median per condition (labels = 2DG dose); {err_text}", out_png)
+    finish(fig, "points: median per condition, colour = treatment, "
+           f"marker = batch; {err_text}", out_png)
 
 
 def plot_all_import_export(kin_summary, y_cols, out_dir):
@@ -428,8 +462,10 @@ def plot_all_import_export(kin_summary, y_cols, out_dir):
               f"{EXPORT_REPORTER}; skipping import vs export graphs")
         return
     batches = list(dict.fromkeys(wide["batch"]))
-    styles = {b: (SERIES_COLORS[i % len(SERIES_COLORS)],
-                  BATCH_MARKERS[i % len(BATCH_MARKERS)]) for i, b in enumerate(batches)}
+    batch_styles = {b: (BATCH_MARKERS[i % len(BATCH_MARKERS)],
+                        BATCH_LINESTYLES[i % len(BATCH_LINESTYLES)])
+                    for i, b in enumerate(batches)}
+    styles = (treatment_colors(wide["treatment"]), batch_styles)
     labels = {"k": y_cols["k"], "rate": f"(1-b)*k (R-sq > {RSQ_THRESHOLD})"}
     folder = "import_vs_export"
     sub_dir = out_dir / folder
