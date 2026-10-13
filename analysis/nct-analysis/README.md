@@ -134,7 +134,7 @@ KW p ≈ 1e-18 to 1e-20; every dose differs from 0 mM (MWU p < 0.015).
 ## Reproducible script: `nct_analysis.py`
 Runs the whole pipeline from the raw inputs (`combined_Results.csv`, `mCherry_BGInt_Results.csv`, `fileid_treatment.csv`). It does not compute count_1.
 
-Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis.py`. Settings include the data folder, an optional `BATCH_FOLDERS` list (each folder is analysed separately, with an optional pooled run via `COMBINE_BATCH`), the bleach method, the QC thresholds and `SAVE_CELL_PLOTS`.
+Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis.py`. `BATCH_FOLDERS` is set to the 20260925, 20260930 and 20261010 MN_110,111 experiments. Their input files are read from each folder's `analysis/` subfolder (`BATCH_DATA_SUBFOLDER`), results go to `analysis/nct_results/`, and with `COMBINE_BATCH = True` a pooled run goes to `nct_results_pooled/` next to the script. To analyse one folder instead, empty `BATCH_FOLDERS` and set `DATA_FOLDER`. Settings include the data folder, an optional `BATCH_FOLDERS` list (each folder is analysed separately, with an optional pooled run via `COMBINE_BATCH`), the bleach method, the QC thresholds and `SAVE_CELL_PLOTS`.
 
 - **ROI filter:** an ROI is kept if it is tracked in every frame and has area ≥ 1000 px in every frame. This reproduces the original 876 cells exactly.
 - **Background:** each frame uses its own image's background. The original `MN_no-glu_110_30s_all.txt` used reporter 111's background for 110 frames 1–28, which looks like a merge-key collision. The difference is about 0.2 grey levels and the results are unchanged.
@@ -143,5 +143,6 @@ Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis
   - figures per reporter: `timecourse_`, `flux_`, `slope_`, `half_time_`, `log_fits_<reporter>.png`, plus `bleach_correction.png`. Stars are Mann-Whitney vs 0 mM, Holm-adjusted.
   - dot plots are superplots: grey dots = single cells, open box = all cells, large markers = median of each experiment (folder) + replicate. A missing `replicate` column or value counts as "A". These medians are also saved in `replicate_medians.csv`.
   - bleaching rate is estimated per experiment × reporter, so the pooled run keeps each folder's own rate.
+  - `export_vs_import_k.png`, `_flux.png`, `_slope.png`: export rate (x) vs import rate (y) per dose, as median ± SD. k uses well-fit cells; flux and model-free slope use bright cells, with export's sign flipped so both axes are positive. The metrics are set by `RATE_SCATTER_METRICS` and the error bars by `RATE_SCATTER_ERROR`. Faint dots are experiment + replicate medians. Once every dose has ≥ 2 of them, the large dot becomes their mean ± SD.
   - `cell_plots/<reporter>_<dose>mM/` when `SAVE_CELL_PLOTS = True`: each cell's trace with its fitted exponential.
 - `script_output/` holds the output of the earlier command-line version.

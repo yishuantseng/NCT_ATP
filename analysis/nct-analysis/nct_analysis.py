@@ -35,13 +35,16 @@ PIPELINE
 
 # --- Which data to analyse ---------------------------------------------------
 # Single run: leave BATCH_FOLDERS empty and set DATA_FOLDER.
-# Batch: list several folders; each must contain the three input files named below.
+# Batch: list one folder per experiment (the folder name is the experiment name). The three input
+# files are read from <folder>/<BATCH_DATA_SUBFOLDER> ("" = the folder itself).
 DATA_FOLDER = "inputs"
 BATCH_FOLDERS = [
-    # "/path/to/experiment_1",
-    # "/path/to/experiment_2",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260930_MN_110,111",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111",
 ]
-COMBINE_BATCH = False        # True: also run one pooled analysis of all BATCH_FOLDERS together
+BATCH_DATA_SUBFOLDER = "analysis"
+COMBINE_BATCH = True         # True: also run one pooled analysis of all BATCH_FOLDERS together
 
 # File names inside each folder. Wildcards are allowed (e.g. "*combined_Results*.csv"),
 # but each pattern must match exactly one file.
@@ -49,7 +52,8 @@ RESULTS_FILE = "combined_Results.csv"
 BG_FILE = "mCherry_BGInt_Results.csv"
 META_FILE = "fileid_treatment.csv"
 
-# Results go to <folder>/<OUTPUT_SUBFOLDER>; the pooled batch run goes to POOLED_OUTPUT.
+# Results go to <data folder>/<OUTPUT_SUBFOLDER>; the pooled batch run goes to POOLED_OUTPUT
+# (a relative POOLED_OUTPUT is placed next to this script).
 OUTPUT_SUBFOLDER = "nct_results"
 POOLED_OUTPUT = "nct_results_pooled"
 
@@ -82,6 +86,12 @@ STAR_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
 
 # --- Dot plots (superplots) ---------------------------------------------------
 CELL_DOT_COLOR = "#b0b0b0"   # single cells in the background
+
+# --- Export vs import rate scatter -------------------------------------------
+RATE_SCATTER_METRICS = ["k_per_min", "flux_pct_per_min", "slope_pct_per_min"]   # one plot each:
+                                    # k (well-fit cells), initial flux and model-free slope (bright cells; export sign flipped)
+RATE_SCATTER_ERROR = "auto"         # "units": SD of experiment+replicate medians; "cells": SD across cells;
+                                    # "auto": units when every dose has >= 2 units, otherwise cells
 
 # --- Per-cell plots ----------------------------------------------------------
 SAVE_CELL_PLOTS = False      # one PNG per cell: trace + fitted exponential (slow for many cells)
@@ -170,8 +180,12 @@ def load(results_path, bg_path, meta_path):
     return res
 
 
-def load_folder(folder):
-    raw = load(find_file(folder, RESULTS_FILE), find_file(folder, BG_FILE), find_file(folder, META_FILE))
+def load_folder(folder, data_folder=None):
+    """Load one experiment. Files are read from data_folder (default: folder); the experiment is
+    named after folder."""
+    data_folder = data_folder or folder
+    raw = load(find_file(data_folder, RESULTS_FILE), find_file(data_folder, BG_FILE),
+               find_file(data_folder, META_FILE))
     raw["source"] = os.path.basename(os.path.normpath(folder))
     return raw
 
@@ -640,6 +654,60 @@ def fig_bleach(bleach, cells, reps, directions, args, path):
     save(fig, path)
 
 
+RATE_NAMES = {"k_per_min": ("k", "per min", "k"),
+              "flux_pct_per_min": ("initial flux", "% of baseline per min", "flux"),
+              "slope_pct_per_min": ("model-free slope", "% of baseline per min", "slope")}
+
+
+def fig_rate_scatter(cells, directions, metric, path):
+    """Export rate (x) vs import rate (y) per dose. Faint dots: median of each experiment + replicate
+    (import and export paired by experiment, replicate and dose). Large dot: mean of those medians
+    (or the cell median when error = cells) with ± SD error bars."""
+    imp = [r for r, d in directions.items() if d == "import" and r in set(cells.reporter)]
+    exp = [r for r, d in directions.items() if d == "export" and r in set(cells.reporter)]
+    if not imp or not exp:
+        return False
+    goodfit = metric in GOODFIT_METRICS
+    c = cells[cells.good_fit if goodfit else cells.bright].copy()
+    # flip export's sign so both axes read as positive rates (taking abs() would turn a blocked
+    # import cell's slightly negative value into a positive rate and inflate the median)
+    c["v"] = np.where(c.direction == "export", -c[metric], c[metric]) if metric != "k_per_min" else c[metric]
+    xi, xe = c[c.reporter == imp[0]], c[c.reporter == exp[0]]
+    ui = xi.groupby(["dose_mM", "unit"]).v.median()
+    ue = xe.groupby(["dose_mM", "unit"]).v.median()
+    units = pd.concat([ue.rename("x"), ui.rename("y")], axis=1).dropna().reset_index()
+    doses = sorted(set(xi.dose_mM) & set(xe.dose_mM))
+    err = RATE_SCATTER_ERROR
+    if err == "auto":
+        err = "units" if all((units.dose_mM == d).sum() >= 2 for d in doses) else "cells"
+    cols = dose_colors(doses)
+    name, unit_label, _ = RATE_NAMES[metric]
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    for d in doses:
+        u = units[units.dose_mM == d]
+        ax.scatter(u.x, u.y, s=40, color=cols[d], alpha=.35, lw=0, zorder=2)
+        if err == "units":
+            mx, my, sx, sy = u.x.mean(), u.y.mean(), u.x.std(), u.y.std()
+        else:
+            ve, vi = xe[xe.dose_mM == d].v, xi[xi.dose_mM == d].v
+            mx, my, sx, sy = ve.median(), vi.median(), ve.std(), vi.std()
+        ax.errorbar(mx, my, xerr=sx, yerr=sy, fmt="o", ms=8, color=cols[d], ecolor=cols[d], elinewidth=1.3,
+                    capsize=4, zorder=3, label=f"{d:g} mM 2DG")
+    ax.set_xlim(left=min(0, ax.get_xlim()[0]))      # include 0 without hiding error bars below it
+    ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
+    ax.set_xlabel(f"export rate, {name} ({unit_label})")
+    ax.set_ylabel(f"import rate, {name} ({unit_label})")
+    centre = "mean of experiment+replicate medians" if err == "units" else "median of cells"
+    ax.set_title(f"Export vs import rate: {centre} ± SD\n({imp[0]} import, {exp[0]} export; "
+                 f"{'well-fit' if goodfit else 'bright'} cells; faint dots = experiment+replicate medians)",
+                 loc="left", fontsize=9)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))
+    style(ax)
+    ax.grid(axis="x", color="#eee")
+    save(fig, path)
+    return True
+
+
 def cell_plots(df, cells, args, outdir):
     """One PNG per cell: normalised and bleach-corrected trace with the fitted exponential."""
     t0 = (args.activation_frame - 1) * args.interval
@@ -758,6 +826,8 @@ def analyse(raw, out, args):
         fig_pct_goodfit(cells, tests, rep, d, args, os.path.join(out, f"pct_well_fit_{rep}.png"))
         fig_logfits(df, cells, rep, d, args, os.path.join(out, f"log_fits_{rep}.png"))
     fig_bleach(bleach, cells, reps, directions, args, os.path.join(out, "bleach_correction.png"))
+    for m in RATE_SCATTER_METRICS:
+        fig_rate_scatter(cells, directions, m, os.path.join(out, f"export_vs_import_{RATE_NAMES[m][2]}.png"))
 
     if SAVE_CELL_PLOTS:
         n = cell_plots(df, cells, args, os.path.join(out, "cell_plots"))
@@ -779,9 +849,10 @@ def main():
     loaded = []
     for folder in BATCH_FOLDERS:
         print(f"=== {folder}")
+        data_folder = os.path.join(folder, BATCH_DATA_SUBFOLDER)
         try:
-            raw = load_folder(folder)
-            analyse(raw, os.path.join(folder, OUTPUT_SUBFOLDER), args)
+            raw = load_folder(folder, data_folder)
+            analyse(raw, os.path.join(data_folder, OUTPUT_SUBFOLDER), args)
             loaded.append(raw)
         except Exception as e:
             print(f"Skipped {folder}: {e}\n")
@@ -792,7 +863,9 @@ def main():
             raw = raw.copy()
             raw["Image"] = raw["source"] + "/" + raw["Image"]
             pooled.append(raw)
-        analyse(pd.concat(pooled, ignore_index=True), POOLED_OUTPUT, args)
+        out = POOLED_OUTPUT if os.path.isabs(POOLED_OUTPUT) else \
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), POOLED_OUTPUT)
+        analyse(pd.concat(pooled, ignore_index=True), out, args)
 
 
 if __name__ == "__main__":
