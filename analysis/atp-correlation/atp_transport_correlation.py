@@ -8,7 +8,7 @@ HOW TO USE
   2. Run the file:  python atp_transport_correlation.py   (or press Run in your editor).
   Requires: numpy, pandas, matplotlib.
 
-INPUT FILES
+INPUT FILES (single run: ATP_FILE + RATES_FOLDER; batch: PAIRS_FILE or BATCH_RUNS pair them per experiment)
   ATP_FILE      Per-cell ATP/ADP measurements (one row per cell; e.g. all_images_measurements.csv)
                 with a treatment column ("0mM 2DG", ...) and a ratio column (ATP_COLUMN).
   RATES_FOLDER  An nct_analysis.py output folder (nct_results/) with rates_per_cell.csv.
@@ -25,7 +25,7 @@ HOW THEY ARE MATCHED
     Only when the same cells carry both measurements. Rows are joined on ATP_CELL_KEY / RATES_CELL_KEY
     and correlated per cell (per reporter, and per dose if PER_DOSE_CELL_STATS).
 
-OUTPUTS (in OUTPUT_FOLDER, one subfolder per rates folder when batching)
+OUTPUTS (in OUTPUT_FOLDER, or OUTPUT_FOLDER/<batch name> for each pair in batch mode)
   atp_by_dose.csv          ATP/ADP per dose: n cells, n images, median, 95% CI, mean, SEM
   rates_vs_atp_by_dose.csv One row per reporter x dose: ATP/ADP and every rate metric (median, CI)
   correlations.csv         One row per reporter x rate metric: r, rho, permutation p, slope, r CI
@@ -40,16 +40,29 @@ OUTPUTS (in OUTPUT_FOLDER, one subfolder per rates folder when batching)
 # =============================================================================
 
 # --- Which data to analyse ---------------------------------------------------
+# Single run: leave PAIRS_FILE empty and BATCH_RUNS empty, and set ATP_FILE and RATES_FOLDER.
 ATP_FILE = "inputs/all_images_measurements.csv"
-# Single run: leave BATCH_RATES_FOLDERS empty and set RATES_FOLDER.
-# Batch: list several nct_results folders; each gets its own output subfolder.
 RATES_FOLDER = "../nct-analysis/inputs/nct_results"
-BATCH_RATES_FOLDERS = [
-    # "../nct-analysis/run1/nct_results",
-    # "../nct-analysis/run2/nct_results",
+
+# Batch, option 1: a pairs table (same format as folder_pairs.csv used by plot_ratio_vs_k.py).
+#   batch,imaging_folders,kinetics_folders,include
+#   20260925_MN,20260925_MN_92,"20260925_MN_110,111",yes
+# imaging_folders hold the ATP file (ATP_FILE_NAME); kinetics_folders are the NCT data folders, read
+# from their NCT_SUBFOLDER (nct_results/) written by nct_analysis.py. Folder names are relative to
+# PAIRS_ROOT; several folders in one cell are separated by ";" and pooled. include = "no" skips a row.
+PAIRS_FILE = ""                               # e.g. "folder_pairs.csv"; "" = not used
+PAIRS_ROOT = ""                               # folder holding the experiment folders ("" = the pairs file's folder)
+NCT_SUBFOLDER = "nct_results"
+
+# Batch, option 2: list the pairs here. Same idea; "atp" and "nct" are paths (absolute, or relative
+# to this script). "atp" may be the CSV or the folder holding it; "nct" may be the nct_results folder
+# or the data folder containing it. Use a list for several folders. "name" = output subfolder.
+BATCH_RUNS = [
+    # {"name": "20260925", "nct": "/path/to/20260925_MN_110,111", "atp": "/path/to/20260925_MN_92"},
 ]
-RATES_FILE = "rates_per_cell.csv"
-OUTPUT_FOLDER = "atp_results"
+ATP_FILE_NAME = "all_images_measurements.csv"  # file looked for when an ATP path is a folder
+RATES_FILE = "rates_per_cell.csv"             # file looked for inside each NCT results folder
+OUTPUT_FOLDER = "atp_results"                 # batch: one subfolder per pair
 
 # --- ATP/ADP measurement -----------------------------------------------------
 ATP_COLUMN = "whole_cell_SN_ratio_488_405"   # also: bright_SN_ratio_488_405, nucleus_SN_ratio_488_405, *_median_*
@@ -165,8 +178,45 @@ def dose_from_treatment(s):
 
 
 # --------------------------------------------------------------------------- loading
-def load_atp():
-    atp = pd.read_csv(here(ATP_FILE))
+def as_list(x):
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+
+def resolve_atp(path):
+    path = here(path)
+    return os.path.join(path, ATP_FILE_NAME) if os.path.isdir(path) else path
+
+
+def resolve_rates(folder):
+    folder = here(folder)
+    if not os.path.exists(os.path.join(folder, RATES_FILE)) and os.path.isdir(os.path.join(folder, NCT_SUBFOLDER)):
+        folder = os.path.join(folder, NCT_SUBFOLDER)
+    return os.path.join(folder, RATES_FILE)
+
+
+def read_pairs():
+    """[(name, [atp paths], [nct folders])] from PAIRS_FILE."""
+    path = here(PAIRS_FILE)
+    root = here(PAIRS_ROOT) if PAIRS_ROOT else os.path.dirname(path)
+    df = pd.read_csv(path, dtype=str).fillna("")
+    runs = []
+    for _, row in df.iterrows():
+        if row.get("include", "yes").strip().lower() in ("no", "n", "false", "0"):
+            print(f"skipping pair {row['batch']} (include = {row['include']})")
+            continue
+        split = lambda col: [os.path.join(root, f.strip()) for f in row[col].split(";") if f.strip()]
+        atp, nct = split("imaging_folders"), split("kinetics_folders")
+        if not atp or not nct:
+            raise SystemExit(f"{path}: pair {row['batch']} needs imaging and kinetics folders")
+        runs.append((row["batch"].strip() or os.path.basename(atp[0]), atp, nct))
+    return runs
+
+
+def load_atp(atp_paths):
+    files = [resolve_atp(p) for p in as_list(atp_paths)]
+    for f in files:
+        print(f"ATP file: {f}")
+    atp = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     n0 = len(atp)
     for col, val in ATP_FILTERS.items():
         atp = atp[atp[col] == val]
@@ -178,8 +228,11 @@ def load_atp():
     return atp
 
 
-def load_rates(folder):
-    rates = pd.read_csv(os.path.join(here(folder), RATES_FILE))
+def load_rates(folders):
+    files = [resolve_rates(f) for f in as_list(folders)]
+    for f in files:
+        print(f"Rates file: {f}")
+    rates = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     if RATES_BRIGHT_ONLY:
         rates = rates[rates["bright"].astype(str) == "True"]
     rates = rates.copy()
@@ -374,12 +427,12 @@ def plot_rate_vs_atp(tab, corr, metrics, path):
 
 
 # --------------------------------------------------------------------------- main
-def run(rates_folder, out):
+def run(atp_paths, rates_folders, out):
     os.makedirs(out, exist_ok=True)
     rng = np.random.default_rng(RANDOM_SEED)
-    atp = load_atp()
-    rates = load_rates(rates_folder)
-    print(f"Rates: {len(rates)} cells from {rates_folder}")
+    atp = load_atp(atp_paths)
+    rates = load_rates(rates_folders)
+    print(f"Rates: {len(rates)} cells")
     if MATCH_MODE == "cell":
         cell_mode(atp, rates, out)
     else:
@@ -388,9 +441,11 @@ def run(rates_folder, out):
 
 
 if __name__ == "__main__":
-    if BATCH_RATES_FOLDERS:
-        for folder in BATCH_RATES_FOLDERS:
-            name = os.path.basename(os.path.dirname(os.path.normpath(here(folder))))
-            run(folder, os.path.join(here(OUTPUT_FOLDER), name))
+    runs = read_pairs() if PAIRS_FILE else [
+        (r.get("name") or f"run{i}", r["atp"], r["nct"]) for i, r in enumerate(BATCH_RUNS, 1)]
+    if runs:
+        for name, atp_paths, nct_folders in runs:
+            print(f"\n=== {name} ===")
+            run(atp_paths, nct_folders, os.path.join(here(OUTPUT_FOLDER), name))
     else:
-        run(RATES_FOLDER, here(OUTPUT_FOLDER))
+        run(ATP_FILE, RATES_FOLDER, here(OUTPUT_FOLDER))
