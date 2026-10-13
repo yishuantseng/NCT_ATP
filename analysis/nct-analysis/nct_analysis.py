@@ -84,7 +84,8 @@ STAR_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
 CELL_DOT_COLOR = "#b0b0b0"   # single cells in the background
 
 # --- Export vs import rate scatter -------------------------------------------
-RATE_SCATTER_METRIC = "k_per_min"   # "k_per_min" (well-fit cells) or "flux_pct_per_min" (bright cells, |value|)
+RATE_SCATTER_METRICS = ["k_per_min", "flux_pct_per_min", "slope_pct_per_min"]   # one plot each:
+                                    # k (well-fit cells), initial flux and model-free slope (bright cells; export sign flipped)
 RATE_SCATTER_ERROR = "auto"         # "units": SD of experiment+replicate medians; "cells": SD across cells;
                                     # "auto": units when every dose has >= 2 units, otherwise cells
 
@@ -645,7 +646,12 @@ def fig_bleach(bleach, cells, reps, directions, args, path):
     save(fig, path)
 
 
-def fig_rate_scatter(cells, directions, path):
+RATE_NAMES = {"k_per_min": ("k", "per min", "k"),
+              "flux_pct_per_min": ("initial flux", "% of baseline per min", "flux"),
+              "slope_pct_per_min": ("model-free slope", "% of baseline per min", "slope")}
+
+
+def fig_rate_scatter(cells, directions, metric, path):
     """Export rate (x) vs import rate (y) per dose. Faint dots: median of each experiment + replicate
     (import and export paired by experiment, replicate and dose). Large dot: mean of those medians
     (or the cell median when error = cells) with ± SD error bars."""
@@ -653,10 +659,11 @@ def fig_rate_scatter(cells, directions, path):
     exp = [r for r, d in directions.items() if d == "export" and r in set(cells.reporter)]
     if not imp or not exp:
         return False
-    metric = RATE_SCATTER_METRIC
     goodfit = metric in GOODFIT_METRICS
     c = cells[cells.good_fit if goodfit else cells.bright].copy()
-    c["v"] = c[metric].abs() if metric.startswith("flux") else c[metric]
+    # flip export's sign so both axes read as positive rates (taking abs() would turn a blocked
+    # import cell's slightly negative value into a positive rate and inflate the median)
+    c["v"] = np.where(c.direction == "export", -c[metric], c[metric]) if metric != "k_per_min" else c[metric]
     xi, xe = c[c.reporter == imp[0]], c[c.reporter == exp[0]]
     ui = xi.groupby(["dose_mM", "unit"]).v.median()
     ue = xe.groupby(["dose_mM", "unit"]).v.median()
@@ -666,8 +673,7 @@ def fig_rate_scatter(cells, directions, path):
     if err == "auto":
         err = "units" if all((units.dose_mM == d).sum() >= 2 for d in doses) else "cells"
     cols = dose_colors(doses)
-    unit_label = "per min" if metric == "k_per_min" else "% of baseline per min"
-    name = "k" if metric == "k_per_min" else "|initial flux|"
+    name, unit_label, _ = RATE_NAMES[metric]
     fig, ax = plt.subplots(figsize=(6.4, 4.6))
     for d in doses:
         u = units[units.dose_mM == d]
@@ -679,8 +685,8 @@ def fig_rate_scatter(cells, directions, path):
             mx, my, sx, sy = ve.median(), vi.median(), ve.std(), vi.std()
         ax.errorbar(mx, my, xerr=sx, yerr=sy, fmt="o", ms=8, color=cols[d], ecolor=cols[d], elinewidth=1.3,
                     capsize=4, zorder=3, label=f"{d:g} mM 2DG")
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=0)
+    ax.set_xlim(left=min(0, ax.get_xlim()[0]))      # include 0 without hiding error bars below it
+    ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
     ax.set_xlabel(f"export rate, {name} ({unit_label})")
     ax.set_ylabel(f"import rate, {name} ({unit_label})")
     centre = "mean of experiment+replicate medians" if err == "units" else "median of cells"
@@ -812,7 +818,8 @@ def analyse(raw, out, args):
         fig_pct_goodfit(cells, tests, rep, d, args, os.path.join(out, f"pct_well_fit_{rep}.png"))
         fig_logfits(df, cells, rep, d, args, os.path.join(out, f"log_fits_{rep}.png"))
     fig_bleach(bleach, cells, reps, directions, args, os.path.join(out, "bleach_correction.png"))
-    fig_rate_scatter(cells, directions, os.path.join(out, "export_vs_import_rate.png"))
+    for m in RATE_SCATTER_METRICS:
+        fig_rate_scatter(cells, directions, m, os.path.join(out, f"export_vs_import_{RATE_NAMES[m][2]}.png"))
 
     if SAVE_CELL_PLOTS:
         n = cell_plots(df, cells, args, os.path.join(out, "cell_plots"))
