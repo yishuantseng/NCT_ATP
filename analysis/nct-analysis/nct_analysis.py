@@ -48,6 +48,8 @@ BATCH_FOLDERS = [
 ]
 BATCH_DATA_SUBFOLDER = "analysis"
 COMBINE_BATCH = True         # True: also run one pooled analysis of all BATCH_FOLDERS together
+POOLED_ONLY = False          # True: run only the pooled analysis (the folders are still read, but their
+                             # own outputs are not redone); combine with REASSIGN_ONLY for a fast rerun
 
 # File names inside each folder. Wildcards are allowed (e.g. "*combined_Results*.csv"),
 # but each pattern must match exactly one file.
@@ -1173,6 +1175,9 @@ def main():
         jobs = [(DATA_FOLDER, DATA_FOLDER)]
     else:
         jobs = [(f, os.path.join(f, BATCH_DATA_SUBFOLDER)) for f in BATCH_FOLDERS]
+    pooled_only = POOLED_ONLY and bool(BATCH_FOLDERS)
+    if pooled_only and not COMBINE_BATCH:
+        print("POOLED_ONLY is set but COMBINE_BATCH is False; running each folder only")
     loaded = []
     for folder, data_folder in jobs:
         print(f"=== {folder}")
@@ -1183,7 +1188,8 @@ def main():
                 raw, meta = None, load_meta(find_file(data_folder, META_FILE), source)
             else:
                 raw, meta = load_folder(folder, data_folder)
-            analyse(raw, meta, out, args)
+            if not (pooled_only and COMBINE_BATCH):
+                analyse(raw, meta, out, args)
             loaded.append((raw, meta))
         except Exception as e:
             if not BATCH_FOLDERS:
