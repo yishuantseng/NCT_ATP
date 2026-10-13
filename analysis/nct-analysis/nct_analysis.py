@@ -35,13 +35,16 @@ PIPELINE
 
 # --- Which data to analyse ---------------------------------------------------
 # Single run: leave BATCH_FOLDERS empty and set DATA_FOLDER.
-# Batch: list several folders; each must contain the three input files named below.
+# Batch: list one folder per experiment (the folder name is the experiment name). The three input
+# files are read from <folder>/<BATCH_DATA_SUBFOLDER> ("" = the folder itself).
 DATA_FOLDER = "inputs"
 BATCH_FOLDERS = [
-    # "/path/to/experiment_1",
-    # "/path/to/experiment_2",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260930_MN_110,111",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111",
 ]
-COMBINE_BATCH = False        # True: also run one pooled analysis of all BATCH_FOLDERS together
+BATCH_DATA_SUBFOLDER = "analysis"
+COMBINE_BATCH = True         # True: also run one pooled analysis of all BATCH_FOLDERS together
 
 # File names inside each folder. Wildcards are allowed (e.g. "*combined_Results*.csv"),
 # but each pattern must match exactly one file.
@@ -49,7 +52,8 @@ RESULTS_FILE = "combined_Results.csv"
 BG_FILE = "mCherry_BGInt_Results.csv"
 META_FILE = "fileid_treatment.csv"
 
-# Results go to <folder>/<OUTPUT_SUBFOLDER>; the pooled batch run goes to POOLED_OUTPUT.
+# Results go to <data folder>/<OUTPUT_SUBFOLDER>; the pooled batch run goes to POOLED_OUTPUT
+# (a relative POOLED_OUTPUT is placed next to this script).
 OUTPUT_SUBFOLDER = "nct_results"
 POOLED_OUTPUT = "nct_results_pooled"
 
@@ -176,8 +180,12 @@ def load(results_path, bg_path, meta_path):
     return res
 
 
-def load_folder(folder):
-    raw = load(find_file(folder, RESULTS_FILE), find_file(folder, BG_FILE), find_file(folder, META_FILE))
+def load_folder(folder, data_folder=None):
+    """Load one experiment. Files are read from data_folder (default: folder); the experiment is
+    named after folder."""
+    data_folder = data_folder or folder
+    raw = load(find_file(data_folder, RESULTS_FILE), find_file(data_folder, BG_FILE),
+               find_file(data_folder, META_FILE))
     raw["source"] = os.path.basename(os.path.normpath(folder))
     return raw
 
@@ -841,9 +849,10 @@ def main():
     loaded = []
     for folder in BATCH_FOLDERS:
         print(f"=== {folder}")
+        data_folder = os.path.join(folder, BATCH_DATA_SUBFOLDER)
         try:
-            raw = load_folder(folder)
-            analyse(raw, os.path.join(folder, OUTPUT_SUBFOLDER), args)
+            raw = load_folder(folder, data_folder)
+            analyse(raw, os.path.join(data_folder, OUTPUT_SUBFOLDER), args)
             loaded.append(raw)
         except Exception as e:
             print(f"Skipped {folder}: {e}\n")
@@ -854,7 +863,9 @@ def main():
             raw = raw.copy()
             raw["Image"] = raw["source"] + "/" + raw["Image"]
             pooled.append(raw)
-        analyse(pd.concat(pooled, ignore_index=True), POOLED_OUTPUT, args)
+        out = POOLED_OUTPUT if os.path.isabs(POOLED_OUTPUT) else \
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), POOLED_OUTPUT)
+        analyse(pd.concat(pooled, ignore_index=True), out, args)
 
 
 if __name__ == "__main__":

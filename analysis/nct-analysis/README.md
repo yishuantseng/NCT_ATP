@@ -134,7 +134,7 @@ KW p ≈ 1e-18 to 1e-20; every dose differs from 0 mM (MWU p < 0.015).
 ## Reproducible script: `nct_analysis.py`
 Runs the whole pipeline from the raw inputs (`combined_Results.csv`, `mCherry_BGInt_Results.csv`, `fileid_treatment.csv`). It does not compute count_1.
 
-Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis.py`. Settings include the data folder, an optional `BATCH_FOLDERS` list (each folder is analysed separately, with an optional pooled run via `COMBINE_BATCH`), the bleach method, the QC thresholds and `SAVE_CELL_PLOTS`.
+Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis.py`. `BATCH_FOLDERS` is set to the 20260925, 20260930 and 20261010 MN_110,111 experiments. Their input files are read from each folder's `analysis/` subfolder (`BATCH_DATA_SUBFOLDER`), results go to `analysis/nct_results/`, and with `COMBINE_BATCH = True` a pooled run goes to `nct_results_pooled/` next to the script. To analyse one folder instead, empty `BATCH_FOLDERS` and set `DATA_FOLDER`. Settings include the data folder, an optional `BATCH_FOLDERS` list (each folder is analysed separately, with an optional pooled run via `COMBINE_BATCH`), the bleach method, the QC thresholds and `SAVE_CELL_PLOTS`.
 
 - **ROI filter:** an ROI is kept if it is tracked in every frame and has area ≥ 1000 px in every frame. This reproduces the original 876 cells exactly.
 - **Background:** each frame uses its own image's background. The original `MN_no-glu_110_30s_all.txt` used reporter 111's background for 110 frames 1–28, which looks like a merge-key collision. The difference is about 0.2 grey levels and the results are unchanged.
