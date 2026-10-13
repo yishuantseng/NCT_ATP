@@ -145,6 +145,9 @@ import pandas as pd
 from scipy import stats
 from scipy.optimize import curve_fit
 
+# numpy < 2.0 has trapz but not trapezoid
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -371,7 +374,7 @@ def per_cell(df, args, directions):
             flux_pct_per_min=k * amp * 6000,
             flux_uncorrected_pct_per_min=k0 * (yinf0 - 1) * 6000,
             slope_pct_per_min=slope, ln_early_rate_per_min=ln_slope,
-            gain_at_t=yc[gain_idx] - 1, auc_frac_min=np.trapezoid(yc[post] - 1, t[post]) / 60,
+            gain_at_t=yc[gain_idx] - 1, auc_frac_min=_trapezoid(yc[post] - 1, t[post]) / 60,
             k_at_bound=bool(k <= 2e-4 or k >= 0.95 * kmax),
             responder=bool(sign * amp >= args.min_amp),
         ))
