@@ -108,12 +108,26 @@ GAIN_TIME_S = 600.0          # time (s) at which gain is reported
 MIN_R2 = 0.8                 # well-fit: R^2 of the exponential fit
 MIN_AMPLITUDE = 0.05         # responder: |amplitude| in the expected direction
 LNZ_WINDOW_S = {"import": 510.0, "export": 210.0}   # plateau-subtracted log fit window after t0
+WRONG_DIR_WINDOW_S = 300.0   # wrong-direction QC: window after activation (s) ...
+WRONG_DIR_MAX = 0.10         # ... cells whose median signal there moved >= this far the wrong way
+                             # (import falling / export rising, as a fraction of baseline) are dropped
+                             # and listed in wrong_direction_cells.csv; None turns the QC off
+
+# --- Rate plots (initial flux and model-free slope) ---------------------------
+RATE_UNIT = "per_min"        # "per_min": min^-1 (e.g. 0.072); "pct": % of baseline per min (e.g. 7.2)
+EXPORT_POSITIVE = True       # plot export rates with the sign reversed, so faster export = larger positive value
+RATE_YSCALE = "linear"       # "linear" or "log" (log leaves out cells with a rate <= 0; their count is noted)
+                             # CSVs and statistics keep the signed % of baseline per min values
 
 # --- Timecourse plots -------------------------------------------------------
 TIMECOURSE_ERRORS = ["sem", "sd"]   # error band(s) to plot; one file per entry ("sem" and/or "sd")
 
 # --- Statistics on plots -----------------------------------------------------
-SHOW_STARS = True            # stars from Mann-Whitney vs control, Holm-adjusted
+SHOW_STARS = True            # stars from the tests vs control, Holm-adjusted
+STATS_UNIT = "auto"          # "cells": Mann-Whitney / Kruskal-Wallis on cells;
+                             # "replicate": t-tests / ANOVA on experiment+replicate medians (paired by
+                             # experiment+replicate when every unit has the control);
+                             # "auto": replicate when every treatment has >= 3 units (pooled runs), else cells
 STAR_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
 
 # --- Dot plots (superplots) ---------------------------------------------------
@@ -506,6 +520,27 @@ def assign(fits, traces, meta):
     return cells, tr
 
 
+def wrong_direction_qc(cells, tr, args, out):
+    """Drop bright cells whose signal clearly moved the wrong way after activation (import falling,
+    export rising): median of the bleach-corrected trace over WRONG_DIR_WINDOW_S after activation."""
+    if WRONG_DIR_MAX is None:
+        return cells, tr
+    t0 = (args.activation_frame - 1) * args.interval
+    w = tr[(tr.time > t0) & (tr.time <= t0 + WRONG_DIR_WINDOW_S)].drop_duplicates(["cell_key", "Slice"])
+    early = w.groupby("cell_key").norm_corr.median() - 1
+    sign = np.where(cells.direction == "import", 1, -1)
+    cells = cells.assign(early_change=cells.cell_key.map(early).values)
+    bad = cells.bright & (-sign * cells.early_change >= WRONG_DIR_MAX)
+    flagged = cells[bad]
+    flagged[["cell_id", "source", "replicate", "reporter", "direction", "treatment", "image", "roi",
+             "early_change", "amplitude", "flux_pct_per_min", "r2"]].to_csv(
+        os.path.join(out, "wrong_direction_cells.csv"), index=False)
+    if len(flagged):
+        print(f"  Wrong-direction QC: dropped {flagged.cell_key.nunique()} bright cells "
+              f"(listed in wrong_direction_cells.csv)")
+    return cells[~bad], tr[~tr.cell_id.isin(flagged.cell_id)]
+
+
 def select(names, spec):
     """Treatments in a plot set, in plotting order."""
     if spec is None:
@@ -538,6 +573,41 @@ def stars(p):
         if p < lvl:
             return s
     return "ns"
+
+
+def replicate_tests(units, rep, col, cells_used, conds, control):
+    """Tests on experiment+replicate medians. units: DataFrame with treatment, unit and col."""
+    out = []
+    groups = {c: units[units.treatment == c].set_index("unit")[col].dropna() for c in conds}
+    groups = {c: g for c, g in groups.items() if len(g)}
+    if control not in groups or len(groups) < 2 or any(len(g) < 2 for g in groups.values()):
+        return out
+    comp = [c for c in conds if c != control and c in groups]
+    ps, names, ns = [], [], []
+    for c in comp:
+        shared = groups[control].index.intersection(groups[c].index)
+        if len(shared) >= 2 and len(shared) == len(groups[c]):
+            ps.append(stats.ttest_rel(groups[control][shared], groups[c][shared]).pvalue)
+            names.append(f"Paired t-test vs {control}")
+        else:
+            ps.append(stats.ttest_ind(groups[control], groups[c], equal_var=False).pvalue)
+            names.append(f"Welch t-test vs {control}")
+    ps = [p if np.isfinite(p) else 1.0 for p in ps]
+    for c, p, pa, name in zip(comp, ps, holm(ps), names):
+        out.append(dict(reporter=rep, metric=col, cells=cells_used, level="replicates", test=name, treatment=c,
+                        n_control=len(groups[control]), n_treatment=len(groups[c]), p=p, p_holm=pa, stars=stars(pa)))
+    an = stats.f_oneway(*groups.values()).pvalue
+    out.append(dict(reporter=rep, metric=col, cells=cells_used, level="replicates", test="ANOVA (replicate medians)",
+                    treatment=np.nan, p=an, stars=stars(an)))
+    return out
+
+
+def stats_level(cells, conds):
+    if STATS_UNIT in ("cells", "replicate"):
+        return "replicates" if STATS_UNIT == "replicate" else "cells"
+    n = cells[cells.bright].groupby(["reporter", "treatment"]).unit.nunique()
+    n = n[n.index.get_level_values("treatment").isin(conds)]
+    return "replicates" if len(n) and n.min() >= 3 else "cells"
 
 
 def summarise(cells, conds, control):
@@ -573,15 +643,17 @@ def summarise(cells, conds, control):
             fields = xx.groupby(["treatment", "image"])[col].median().reset_index()
             fgroups = [g[col].dropna() for _, g in fields.groupby("treatment")]
             kwf = stats.kruskal(*fgroups).pvalue if all(len(g) >= 2 for g in fgroups) else np.nan
+            ucol = xx.groupby(["treatment", "unit"])[col].median().reset_index()
+            tests += replicate_tests(ucol, rep, col, cells_used, conds, control)
             comp = [c for c in others if c in groups]
             ps = [stats.mannwhitneyu(groups[control], groups[c]).pvalue for c in comp]
             for c, p, pa in zip(comp, ps, holm(ps)):
-                tests.append(dict(reporter=rep, metric=col, cells=cells_used, test=f"Mann-Whitney vs {control}",
+                tests.append(dict(reporter=rep, metric=col, cells=cells_used, level="cells", test=f"Mann-Whitney vs {control}",
                                   treatment=c, n_control=len(groups[control]), n_treatment=len(groups[c]),
                                   p=p, p_holm=pa, stars=stars(pa)))
-            tests.append(dict(reporter=rep, metric=col, cells=cells_used, test="Kruskal-Wallis (cells)",
+            tests.append(dict(reporter=rep, metric=col, cells=cells_used, level="cells", test="Kruskal-Wallis (cells)",
                               treatment=np.nan, p=kw, stars=stars(kw)))
-            tests.append(dict(reporter=rep, metric=col, cells=cells_used, test="Kruskal-Wallis (field medians)",
+            tests.append(dict(reporter=rep, metric=col, cells=cells_used, level="cells", test="Kruskal-Wallis (field medians)",
                               treatment=np.nan, p=kwf, stars=stars(kwf)))
         # fraction of bright cells that are well-fit: Fisher's exact test vs control, chi-square across treatments
         present = [c for c in conds if (x.treatment == c).any()]
@@ -591,16 +663,18 @@ def summarise(cells, conds, control):
             comp = [c for c in others if c in table]
             ps = [stats.fisher_exact([table[control], table[c]])[1] for c in comp]
             for c, p, pa in zip(comp, ps, holm(ps)):
-                tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright",
+                tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright", level="cells",
                                   test=f"Fisher exact vs {control}", treatment=c, n_control=sum(table[control]),
                                   n_treatment=sum(table[c]), p=p, p_holm=pa, stars=stars(pa)))
+            pu = x.groupby(["treatment", "unit"]).good_fit.mean().mul(100).rename("pct_good_fit").reset_index()
+            tests += replicate_tests(pu, rep, "pct_good_fit", "bright", conds, control)
             tab = list(table.values())
             chi = stats.chi2_contingency(tab)[1] if min(map(sum, zip(*tab))) > 0 else np.nan
-            tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright", test="Chi-square (treatments)",
+            tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright", level="cells", test="Chi-square (treatments)",
                               treatment=np.nan, p=chi, stars=stars(chi)))
     tests = pd.DataFrame(tests)
     if tests.empty:
-        tests = pd.DataFrame(columns=["reporter", "metric", "cells", "test", "treatment", "n_control",
+        tests = pd.DataFrame(columns=["reporter", "metric", "cells", "level", "test", "treatment", "n_control",
                                       "n_treatment", "p", "p_holm", "stars"])
     return pd.DataFrame(rows), tests
 
@@ -712,34 +786,66 @@ def strip(ax, x, col, conds, colors, fmt="{:.1f}", clip=None):
     style(ax)
 
 
+STARS_LEVEL = "cells"        # set per plot set by report() from STATS_UNIT
+
+
 def add_stars(ax, tests, rep, metric, conds, control):
     if not SHOW_STARS or tests.empty:
         return
-    t = tests[(tests.reporter == rep) & (tests.metric == metric)]
+    t = tests[(tests.reporter == rep) & (tests.metric == metric) & (tests.level == STARS_LEVEL)]
     if t.empty:
         return
     lo, hi = ax.get_ylim()
+    y = hi * (lo / hi) ** 0.03 if ax.get_yscale() == "log" else hi - 0.03 * (hi - lo)
     for i, cond in enumerate(conds):
         s = t[t.treatment == cond]
         if len(s):
-            ax.text(i, hi - 0.03 * (hi - lo), s.stars.iloc[0], ha="center", va="top", fontsize=10, color="#222")
+            ax.text(i, y, s.stars.iloc[0], ha="center", va="top", fontsize=10, color="#222")
     pair = t[t.p_holm.notna()].test.iloc[0].split(" vs ")[0] if t.p_holm.notna().any() else "test"
-    kw = t[t.test.isin(["Kruskal-Wallis (cells)", "Chi-square (treatments)"])]
-    note = f"Stars: {pair} vs {control}, Holm-adjusted"
+    kw = t[t.test.isin(["Kruskal-Wallis (cells)", "Chi-square (treatments)", "ANOVA (replicate medians)"])]
+    unit = "experiment+replicate medians" if STARS_LEVEL == "replicates" else "cells"
+    note = f"Stars: {pair} vs {control} on {unit}, Holm-adjusted"
     if len(kw):
         note += f"   {kw.test.iloc[0].split(' (')[0]} p = {kw.p.iloc[0]:.2g}"
     ax.annotate(note, xy=(0, 0), xycoords="figure fraction", xytext=(6, 4), textcoords="offset points",
                 fontsize=7, color="#666")
 
 
+RATE_COLS = {"flux_pct_per_min", "slope_pct_per_min"}
+
+
+def rate_scale(direction):
+    """Factor that converts a stored rate (signed % of baseline per min) to the plotted value."""
+    sign = -1 if (EXPORT_POSITIVE and direction == "export") else 1
+    return sign * (0.01 if RATE_UNIT == "per_min" else 1)
+
+
+def rate_label(direction):
+    unit = "min⁻¹" if RATE_UNIT == "per_min" else "% of baseline per min"
+    if EXPORT_POSITIVE and direction == "export":
+        return f"export rate, sign reversed ({unit})"
+    return f"{direction} rate ({unit})"
+
+
 def fig_metric(cells, tests, conds, control, rep, direction, metric, title, ylabel, path, goodfit=False,
                fmt="{:.1f}", clip=None, zero_line=True):
     x = cells[cells.good_fit if goodfit else cells.bright]
     x = x[x.reporter == rep]
+    log = False
+    if metric in RATE_COLS:
+        x = x.assign(**{metric: x[metric] * rate_scale(direction)})
+        ylabel = rate_label(direction)
+        if RATE_YSCALE == "log":
+            log, n_drop = True, int((x[metric] <= 0).sum())
+            x = x[x[metric] > 0]
+            zero_line = False
+            title += f"\n(log scale; {n_drop} cells with rate ≤ 0 not shown)"
     fig, ax = plt.subplots(figsize=(max(6, 1 + 1.0 * len(conds)), 5))
+    if log:
+        ax.set_yscale("log")
     strip(ax, x, metric, conds, shades(direction, len(conds)), fmt=fmt, clip=clip)
     lo, hi = ax.get_ylim()
-    ax.set_ylim(lo, hi + 0.12 * (hi - lo))            # headroom for stars
+    ax.set_ylim(lo, hi * (hi / lo) ** 0.12 if log else hi + 0.12 * (hi - lo))   # headroom for stars
     if zero_line:
         ax.axhline(0, color="#999", lw=.8, ls="--")
     ax.set_title(title, loc="left", fontsize=10)
@@ -860,7 +966,7 @@ def fig_bleach(bleach_tab, cells, conds, control, reps, directions, args, path):
     save(fig, path)
 
 
-RATE_NAMES = {"k_per_min": ("k", "per min", "k"),
+RATE_NAMES = {"k_per_min": ("k", "min⁻¹", "k"),
               "flux_pct_per_min": ("initial flux", "% of baseline per min", "flux"),
               "slope_pct_per_min": ("model-free slope", "% of baseline per min", "slope")}
 
@@ -877,7 +983,10 @@ def fig_rate_scatter(cells, conds, directions, metric, path):
     c = cells[cells.good_fit if goodfit else cells.bright].copy()
     # flip export's sign so both axes read as positive rates (taking abs() would turn a blocked
     # import cell's slightly negative value into a positive rate and inflate the median)
-    c["v"] = np.where(c.direction == "export", -c[metric], c[metric]) if metric != "k_per_min" else c[metric]
+    if metric in RATE_COLS:
+        c["v"] = c[metric] * np.where(c.direction == "export", -1, 1) * (0.01 if RATE_UNIT == "per_min" else 1)
+    else:
+        c["v"] = c[metric]
     xi, xe = c[c.reporter == imp[0]], c[c.reporter == exp[0]]
     ui = xi.groupby(["treatment", "unit"]).v.median()
     ue = xe.groupby(["treatment", "unit"]).v.median()
@@ -890,6 +999,8 @@ def fig_rate_scatter(cells, conds, directions, metric, path):
         err = "units" if all((units.treatment == cd).sum() >= 2 for cd in both) else "cells"
     cols = cond_colors(conds)
     name, unit_label, _ = RATE_NAMES[metric]
+    if metric in RATE_COLS and RATE_UNIT == "per_min":
+        unit_label = "min⁻¹"
     fig, ax = plt.subplots(figsize=(6.8, 4.6))
     for cd in both:
         u = units[units.treatment == cd]
@@ -903,7 +1014,7 @@ def fig_rate_scatter(cells, conds, directions, metric, path):
                     capsize=4, zorder=3, label=cd)
     ax.set_xlim(left=min(0, ax.get_xlim()[0]))      # include 0 without hiding error bars below it
     ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
-    ax.set_xlabel(f"export rate, {name} ({unit_label})")
+    ax.set_xlabel(f"export rate, {name}{', sign reversed' if metric in RATE_COLS else ''} ({unit_label})")
     ax.set_ylabel(f"import rate, {name} ({unit_label})")
     centre = "mean of experiment+replicate medians" if err == "units" else "median of cells"
     ax.set_title(f"Export vs import rate: {centre} ± SD\n({imp[0]} import, {exp[0]} export; "
@@ -942,7 +1053,7 @@ def cell_plots(traces, cells, args, outdir):
                    "non-responder" if not r.responder else "k at bound" if r.k_at_bound else "low R²")
         treat = ", ".join(cells[cells.cell_key == key].treatment)
         ax.set_title(f"{os.path.basename(r.image)} ROI {r.roi}  ({r.reporter}; {treat})\n"
-                     f"flux {r.flux_pct_per_min:.1f} %/min · amp {r.amplitude:.2f} · "
+                     (f"flux {r.flux_pct_per_min / 100:.3f} min⁻¹" if RATE_UNIT == "per_min" else f"flux {r.flux_pct_per_min:.1f} %/min") + f" · amp {r.amplitude:.2f} · "
                      f"t½ {r.t_half_s:.0f} s · R² {r.r2:.2f} · {verdict}", loc="left", fontsize=8)
         ax.set_xlabel("time (s)")
         ax.set_ylabel("nuclear signal / baseline")
@@ -963,8 +1074,11 @@ def report(cells, tr, bleach_tab, conds, control, directions, args, out):
     os.makedirs(out, exist_ok=True)
     cells = cells[cells.treatment.isin(conds)]
     tr = tr[tr.treatment.isin(conds)]
+    global STARS_LEVEL
     reps = sorted(cells.reporter.unique())
     summary, tests = summarise(cells, conds, control)
+    STARS_LEVEL = stats_level(cells, conds)
+    print(f"  Statistics on plots: {'experiment+replicate medians' if STARS_LEVEL == 'replicates' else 'cells'}")
     tc_long, tc_wide = timecourse_tables(tr, conds)
 
     keep = ["source", "row_id", "cell_id", "Image", "roi", "Slice", "time", "reporter", "treatment", "replicate",
@@ -994,7 +1108,8 @@ def report(cells, tr, bleach_tab, conds, control, directions, args, out):
             fig_timecourse(tr, conds, rep, d, args, os.path.join(out, f"timecourse_{rep}{suffix}.png"), err=err)
         ref = cells[cells.bright & (cells.reporter == rep) & (cells.treatment == control)].flux_pct_per_min.median()
         fig_metric(cells, tests, conds, control, rep, d, "flux_pct_per_min",
-                   f"{rep} ({d}): initial flux k × amplitude, all bright cells\n({control} median {ref:.1f})",
+                   f"{rep} ({d}): initial flux k × amplitude, all bright cells\n({control} median "
+                   f"{ref * rate_scale(d):.3g})",
                    "% of baseline per min", os.path.join(out, f"flux_{rep}.png"))
         fig_metric(cells, tests, conds, control, rep, d, "slope_pct_per_min",
                    f"{rep} ({d}): model-free initial slope, all bright cells\n(linear fit, frames "
@@ -1005,7 +1120,7 @@ def report(cells, tr, bleach_tab, conds, control, directions, args, out):
                    os.path.join(out, f"half_time_{rep}.png"), goodfit=True, fmt="{:.0f}", clip=(0, 600),
                    zero_line=False)
         fig_metric(cells, tests, conds, control, rep, d, "k_per_min",
-                   f"{rep} ({d}): rate constant k of fitted exponential, well-fit cells", "k (per min)",
+                   f"{rep} ({d}): rate constant k of fitted exponential, well-fit cells", "k (min⁻¹)",
                    os.path.join(out, f"k_{rep}.png"), goodfit=True, fmt="{:.2f}", zero_line=False)
         fig_pct_goodfit(cells, tests, conds, control, rep, d, args, os.path.join(out, f"pct_well_fit_{rep}.png"))
         fig_logfits(tr, cells, conds, rep, d, args, os.path.join(out, f"log_fits_{rep}.png"))
@@ -1031,6 +1146,7 @@ def analyse(raw, meta, out, args):
                                  for r in bleach_tab.itertuples()})
 
     cells, tr = assign(fits, traces, meta)
+    cells, tr = wrong_direction_qc(cells, tr, args, out)
     names = list(cells.treatment.unique())
     for set_name, spec in PLOT_SETS.items():
         conds = select(names, spec)
