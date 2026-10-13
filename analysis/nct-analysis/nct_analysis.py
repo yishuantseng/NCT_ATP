@@ -110,6 +110,18 @@ warnings.filterwarnings("ignore")
 
 DOSE_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
 REPORTER_COLORS = {"import": "#2a78d6", "export": "#c2410c"}
+# per-dose shades of the reporter colour (light -> dark = low -> high dose) for the dot plots
+SHADES = {"import": ["#6fa5e8", "#4a8fe0", "#2a78d6", "#1c5cab", "#104281"],
+          "export": ["#ec9460", "#df6a2c", "#c2410c", "#923109", "#632106"]}
+
+
+def shades(direction, n):
+    ramp = SHADES[direction]
+    if n <= len(ramp):
+        return [ramp[round(i * (len(ramp) - 1) / max(n - 1, 1))] for i in range(n)] if n > 1 else [ramp[2]]
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("r", ramp)
+    return [cmap(i / (n - 1)) for i in range(n)]
 
 
 def settings():
@@ -444,13 +456,14 @@ def fig_timecourse(df, rep, direction, args, path, err="sem"):
 UNIT_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "<", ">"]
 
 
-def strip(ax, x, col, doses, color, fmt="{:.1f}", clip=None):
+def strip(ax, x, col, doses, colors, fmt="{:.1f}", clip=None):
     """Superplot: every cell as a small grey dot, an unfilled box per dose, and the median of
     each experiment + replicate as a large dot (marker shape = experiment + replicate)."""
     rng = np.random.default_rng(1)
     units = sorted(x.unit.unique())
     markers = {u: UNIT_MARKERS[i % len(UNIT_MARKERS)] for i, u in enumerate(units)}
     for i, d in enumerate(doses):
+        color = colors[i]
         g = x[(x.dose_mM == d) & x[col].notna()]
         if len(g) == 0:
             continue
@@ -468,7 +481,7 @@ def strip(ax, x, col, doses, color, fmt="{:.1f}", clip=None):
                        alpha=.9, zorder=3)
     if len(units) > 1:
         from matplotlib.lines import Line2D
-        ax.legend([Line2D([], [], ls="", marker=markers[u], color=color, ms=6) for u in units], units,
+        ax.legend([Line2D([], [], ls="", marker=markers[u], color="#555", ms=6) for u in units], units,
                   frameon=False, fontsize=7, title="experiment_replicate median", title_fontsize=7,
                   loc="upper left", bbox_to_anchor=(1.01, 1))
     ax.set_xticks(range(len(doses)), [f"{d:g}\n(n={x[x.dose_mM == d][col].notna().sum()})" for d in doses],
@@ -503,7 +516,7 @@ def fig_metric(cells, tests, rep, direction, metric, title, ylabel, path, goodfi
     x = x[x.reporter == rep]
     doses = sorted(cells[cells.reporter == rep].dose_mM.unique())
     fig, ax = plt.subplots(figsize=(6, 4.8))
-    strip(ax, x, metric, doses, REPORTER_COLORS[direction], fmt=fmt, clip=clip)
+    strip(ax, x, metric, doses, shades(direction, len(doses)), fmt=fmt, clip=clip)
     if robust_ylim and x[metric].notna().any():
         lo, hi = np.percentile(x[metric].dropna(), [1, 99])
         ax.set_ylim(min(lo, 0) * 1.1, max(hi, 0) * 1.1)

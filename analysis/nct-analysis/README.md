@@ -141,5 +141,7 @@ Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis
 - **Outputs** (in `<folder>/nct_results/`; the current run is in `inputs/nct_results/`):
   - tables: `timecourses_long.csv`, `timecourse_mean_by_dose.csv`, `timecourse_<reporter>_wide.csv`, `rates_per_cell.csv`, `summary_by_dose.csv`, `statistics.csv`, `bleach_rates.csv`
   - figures per reporter: `timecourse_`, `flux_`, `slope_`, `half_time_`, `log_fits_<reporter>.png`, plus `bleach_correction.png`. Stars are Mann-Whitney vs 0 mM, Holm-adjusted.
+  - dot plots are superplots: grey dots = single cells, open box = all cells, large markers = median of each experiment (folder) + replicate. A missing `replicate` column or value counts as "A". These medians are also saved in `replicate_medians.csv`.
+  - bleaching rate is estimated per experiment × reporter, so the pooled run keeps each folder's own rate.
   - `cell_plots/<reporter>_<dose>mM/` when `SAVE_CELL_PLOTS = True`: each cell's trace with its fitted exponential.
 - `script_output/` holds the output of the earlier command-line version.
