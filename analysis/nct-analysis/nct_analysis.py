@@ -83,6 +83,11 @@ STAR_LEVELS = [(0.001, "***"), (0.01, "**"), (0.05, "*")]
 # --- Dot plots (superplots) ---------------------------------------------------
 CELL_DOT_COLOR = "#b0b0b0"   # single cells in the background
 
+# --- Export vs import rate scatter -------------------------------------------
+RATE_SCATTER_METRIC = "k_per_min"   # "k_per_min" (well-fit cells) or "flux_pct_per_min" (bright cells, |value|)
+RATE_SCATTER_ERROR = "auto"         # "units": SD of experiment+replicate medians; "cells": SD across cells;
+                                    # "auto": units when every dose has >= 2 units, otherwise cells
+
 # --- Per-cell plots ----------------------------------------------------------
 SAVE_CELL_PLOTS = False      # one PNG per cell: trace + fitted exponential (slow for many cells)
 CELL_PLOTS_BRIGHT_ONLY = True
@@ -640,6 +645,55 @@ def fig_bleach(bleach, cells, reps, directions, args, path):
     save(fig, path)
 
 
+def fig_rate_scatter(cells, directions, path):
+    """Export rate (x) vs import rate (y) per dose. Faint dots: median of each experiment + replicate
+    (import and export paired by experiment, replicate and dose). Large dot: mean of those medians
+    (or the cell median when error = cells) with ± SD error bars."""
+    imp = [r for r, d in directions.items() if d == "import" and r in set(cells.reporter)]
+    exp = [r for r, d in directions.items() if d == "export" and r in set(cells.reporter)]
+    if not imp or not exp:
+        return False
+    metric = RATE_SCATTER_METRIC
+    goodfit = metric in GOODFIT_METRICS
+    c = cells[cells.good_fit if goodfit else cells.bright].copy()
+    c["v"] = c[metric].abs() if metric.startswith("flux") else c[metric]
+    xi, xe = c[c.reporter == imp[0]], c[c.reporter == exp[0]]
+    ui = xi.groupby(["dose_mM", "unit"]).v.median()
+    ue = xe.groupby(["dose_mM", "unit"]).v.median()
+    units = pd.concat([ue.rename("x"), ui.rename("y")], axis=1).dropna().reset_index()
+    doses = sorted(set(xi.dose_mM) & set(xe.dose_mM))
+    err = RATE_SCATTER_ERROR
+    if err == "auto":
+        err = "units" if all((units.dose_mM == d).sum() >= 2 for d in doses) else "cells"
+    cols = dose_colors(doses)
+    unit_label = "per min" if metric == "k_per_min" else "% of baseline per min"
+    name = "k" if metric == "k_per_min" else "|initial flux|"
+    fig, ax = plt.subplots(figsize=(6.4, 4.6))
+    for d in doses:
+        u = units[units.dose_mM == d]
+        ax.scatter(u.x, u.y, s=40, color=cols[d], alpha=.35, lw=0, zorder=2)
+        if err == "units":
+            mx, my, sx, sy = u.x.mean(), u.y.mean(), u.x.std(), u.y.std()
+        else:
+            ve, vi = xe[xe.dose_mM == d].v, xi[xi.dose_mM == d].v
+            mx, my, sx, sy = ve.median(), vi.median(), ve.std(), vi.std()
+        ax.errorbar(mx, my, xerr=sx, yerr=sy, fmt="o", ms=8, color=cols[d], ecolor=cols[d], elinewidth=1.3,
+                    capsize=4, zorder=3, label=f"{d:g} mM 2DG")
+    ax.set_xlim(left=0)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel(f"export rate, {name} ({unit_label})")
+    ax.set_ylabel(f"import rate, {name} ({unit_label})")
+    centre = "mean of experiment+replicate medians" if err == "units" else "median of cells"
+    ax.set_title(f"Export vs import rate: {centre} ± SD\n({imp[0]} import, {exp[0]} export; "
+                 f"{'well-fit' if goodfit else 'bright'} cells; faint dots = experiment+replicate medians)",
+                 loc="left", fontsize=9)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))
+    style(ax)
+    ax.grid(axis="x", color="#eee")
+    save(fig, path)
+    return True
+
+
 def cell_plots(df, cells, args, outdir):
     """One PNG per cell: normalised and bleach-corrected trace with the fitted exponential."""
     t0 = (args.activation_frame - 1) * args.interval
@@ -758,6 +812,7 @@ def analyse(raw, out, args):
         fig_pct_goodfit(cells, tests, rep, d, args, os.path.join(out, f"pct_well_fit_{rep}.png"))
         fig_logfits(df, cells, rep, d, args, os.path.join(out, f"log_fits_{rep}.png"))
     fig_bleach(bleach, cells, reps, directions, args, os.path.join(out, "bleach_correction.png"))
+    fig_rate_scatter(cells, directions, os.path.join(out, "export_vs_import_rate.png"))
 
     if SAVE_CELL_PLOTS:
         n = cell_plots(df, cells, args, os.path.join(out, "cell_plots"))

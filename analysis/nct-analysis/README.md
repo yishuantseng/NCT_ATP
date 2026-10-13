@@ -143,5 +143,6 @@ Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis
   - figures per reporter: `timecourse_`, `flux_`, `slope_`, `half_time_`, `log_fits_<reporter>.png`, plus `bleach_correction.png`. Stars are Mann-Whitney vs 0 mM, Holm-adjusted.
   - dot plots are superplots: grey dots = single cells, open box = all cells, large markers = median of each experiment (folder) + replicate. A missing `replicate` column or value counts as "A". These medians are also saved in `replicate_medians.csv`.
   - bleaching rate is estimated per experiment × reporter, so the pooled run keeps each folder's own rate.
+  - `export_vs_import_rate.png`: export rate (x) vs import rate (y) per dose, as median ± SD (k of well-fit cells by default; see `RATE_SCATTER_METRIC` / `RATE_SCATTER_ERROR`). Faint dots are experiment + replicate medians. Once every dose has ≥ 2 of them, the large dot becomes their mean ± SD.
   - `cell_plots/<reporter>_<dose>mM/` when `SAVE_CELL_PLOTS = True`: each cell's trace with its fitted exponential.
 - `script_output/` holds the output of the earlier command-line version.
