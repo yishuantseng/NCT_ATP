@@ -8,7 +8,8 @@ HOW TO USE
   2. Run the file:  python atp_transport_correlation.py   (or press Run in your editor).
   Requires: numpy, pandas, matplotlib.
 
-INPUT FILES (single run: ATP_FILE + RATES_FOLDER; batch: PAIRS_FILE or BATCH_RUNS pair them per experiment)
+INPUT FILES (single run: ATP_FILE + RATES_FOLDER; batch: PAIRS_FILE or BATCH_RUNS pair them per experiment;
+             bulk: BULK_ATP + BULK_NCT pool everything found, unpaired)
   ATP_FILE      Per-cell ATP/ADP measurements (one row per cell; e.g. all_images_measurements.csv)
                 with a treatment column ("0mM 2DG", ...) and a ratio column (ATP_COLUMN).
   RATES_FOLDER  An nct_analysis.py output folder (nct_results/) with rates_per_cell.csv.
@@ -40,7 +41,7 @@ OUTPUTS (in OUTPUT_FOLDER, or OUTPUT_FOLDER/<batch name> for each pair in batch 
 # =============================================================================
 
 # --- Which data to analyse ---------------------------------------------------
-# Single run: leave PAIRS_FILE empty and BATCH_RUNS empty, and set ATP_FILE and RATES_FOLDER.
+# Single run: leave PAIRS_FILE, BATCH_RUNS, BULK_ATP and BULK_NCT empty, and set ATP_FILE and RATES_FOLDER.
 ATP_FILE = "inputs/all_images_measurements.csv"
 RATES_FOLDER = "../nct-analysis/inputs/nct_results"
 
@@ -60,6 +61,18 @@ NCT_SUBFOLDER = "nct_results"
 BATCH_RUNS = [
     # {"name": "20260925", "nct": "/path/to/20260925_MN_110,111", "atp": "/path/to/20260925_MN_92"},
 ]
+# Bulk (no pairing): pool every ATP file and every NCT result found below these folders, and
+# compare them by dose. Use this when ATP and NCT experiments don't come in matched pairs.
+# Folders are searched recursively for ATP_FILE_NAME and for <NCT_SUBFOLDER>/RATES_FILE.
+# Used when PAIRS_FILE is "" and BATCH_RUNS is empty; results go to OUTPUT_FOLDER/BULK_NAME.
+BULK_ATP = [
+    # "/path/to/ATP_experiments",            # e.g. folder holding 20260925_MN_92, 20260930_MN_92, ...
+]
+BULK_NCT = [
+    # "/path/to/NCT_experiments",            # e.g. folder holding 20260925_MN_110,111/nct_results, ...
+]
+BULK_NAME = "bulk"
+
 ATP_FILE_NAME = "all_images_measurements.csv"  # file looked for when an ATP path is a folder
 RATES_FILE = "rates_per_cell.csv"             # file looked for inside each NCT results folder
 OUTPUT_FOLDER = "atp_results"                 # batch: one subfolder per pair
@@ -108,6 +121,7 @@ FIG_DPI = 200
 # END OF PARAMETERS
 # =============================================================================
 
+import glob
 import itertools
 import os
 import re
@@ -192,6 +206,23 @@ def resolve_rates(folder):
     if not os.path.exists(os.path.join(folder, RATES_FILE)) and os.path.isdir(os.path.join(folder, NCT_SUBFOLDER)):
         folder = os.path.join(folder, NCT_SUBFOLDER)
     return os.path.join(folder, RATES_FILE)
+
+
+def find_files(paths, file_name, parent=None):
+    """CSV paths as given; folders searched recursively for file_name (inside a folder named parent)."""
+    found = []
+    for p in as_list(paths):
+        p = here(p)
+        if os.path.isdir(p):
+            hits = sorted(glob.glob(os.path.join(p, "**", file_name), recursive=True))
+            if parent:
+                hits = [h for h in hits if os.path.basename(os.path.dirname(h)) == parent]
+            if not hits:
+                raise SystemExit(f"No {file_name} found under {p}")
+            found += hits
+        else:
+            found.append(p)
+    return found
 
 
 def read_pairs():
@@ -447,5 +478,11 @@ if __name__ == "__main__":
         for name, atp_paths, nct_folders in runs:
             print(f"\n=== {name} ===")
             run(atp_paths, nct_folders, os.path.join(here(OUTPUT_FOLDER), name))
+    elif BULK_ATP or BULK_NCT:
+        if not (BULK_ATP and BULK_NCT):
+            raise SystemExit("Bulk mode needs both BULK_ATP and BULK_NCT")
+        # only <NCT_SUBFOLDER>/rates_per_cell.csv, so pooled re-runs (nct_results_pooled/) aren't counted twice
+        nct = [os.path.dirname(f) for f in find_files(BULK_NCT, RATES_FILE, parent=NCT_SUBFOLDER)]
+        run(find_files(BULK_ATP, ATP_FILE_NAME), nct, os.path.join(here(OUTPUT_FOLDER), BULK_NAME))
     else:
         run(ATP_FILE, RATES_FOLDER, here(OUTPUT_FOLDER))

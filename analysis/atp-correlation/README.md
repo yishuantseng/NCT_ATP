@@ -10,6 +10,13 @@ python atp_transport_correlation.py
 
 Requires numpy, pandas and matplotlib.
 
+## Bulk run (no pairing)
+
+Set `BULK_ATP` and `BULK_NCT` to one or more folders. The script searches them recursively for every
+`all_images_measurements.csv` and every `nct_results/rates_per_cell.csv` (folders named
+`nct_results_pooled/` are skipped so their cells aren't counted twice). It then pools all the cells and
+compares ATP/ADP with the transport rates by dose. The results go to `atp_results/bulk/`.
+
 ## Batch runs (NCT and ATP in different folders)
 
 Each experiment needs its NCT results and its ATP file paired. There are two ways to do it:
