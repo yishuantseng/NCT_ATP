@@ -3,7 +3,7 @@
 Nuclear transport (NCT) analysis of photoactivatable reporter time-lapses.
 
 HOW TO USE
-  1. Edit the PARAMETERS block below (file names, folders, settings).
+  1. Edit the PARAMETERS block below (file names, folders, treatments, settings).
   2. Run the file:  python nct_analysis.py   (or press Run in your editor).
   Requires: numpy, pandas, scipy, matplotlib.
 
@@ -12,10 +12,12 @@ INPUT FILES (CSV) in each data folder
                 (Label like "<image>_561.tif:<slice> - ID <roi>:<slice>")
   BG_FILE       Background intensity per image and frame (Label like "<image>_561.tif", Slice 0-based)
   META_FILE     Image -> condition table (image, reporter, treatment, time, pyruvate, replicate;
-                image = name without the _XY<n> field suffix)
+                image = name without the _XY<n> field suffix). An image may appear on several rows
+                with different treatments; its cells are then used in each of those treatments.
 
 PIPELINE
-  1. Parse labels, attach conditions and per-frame background.
+  Fit stage (per cell, independent of treatment; cached in <output>/_cache/):
+  1. Parse labels and attach per-frame background; reporter per image comes from META_FILE.
   2. Keep ROIs tracked through every frame with area >= MIN_AREA_PX.
   3. Normalise: norm(t) = (Mean(t) - bg(t)) / (mean(Mean, frames 1..A) - bg(t)), A = activation frame.
   4. QC: "bright" cells have baseline - bg >= MIN_BASELINE grey levels.
@@ -25,8 +27,9 @@ PIPELINE
        y(t) = y_inf + (1 - y_inf) * exp(-k (t - t0)),  k <= 1/interval
      -> amplitude = y_inf - 1, half-time ln2/k, initial flux = k * amplitude (recommended rate),
         plus a model-free initial slope, plateau-subtracted log fit, gain at a fixed time and AUC.
-  7. Per reporter x dose summaries, statistics (Kruskal-Wallis; Mann-Whitney vs control, Holm)
-     and figures, with significance stars from the Holm-adjusted Mann-Whitney tests.
+  Assign stage: attach treatments (and replicates) from META_FILE. REASSIGN_ONLY = True reruns from here.
+  Report stage, per plot set: per reporter x treatment summaries, statistics (Kruskal-Wallis;
+     Mann-Whitney vs the control treatment, Holm) and figures.
 """
 
 # =============================================================================
@@ -56,6 +59,35 @@ META_FILE = "fileid_treatment.csv"
 # (a relative POOLED_OUTPUT is placed next to this script).
 OUTPUT_SUBFOLDER = "nct_results"
 POOLED_OUTPUT = "nct_results_pooled"
+
+# --- Rerun only the treatment assignment ---------------------------------------
+# True: skip loading the measurements and fitting; reuse the per-cell fits saved by the last full run
+# (<output>/_cache/) and only re-read META_FILE, then redo summaries, statistics and plots.
+# Use it after fixing treatments or replicates. Changing a reporter, the measurements or any
+# fitting/bleaching/QC setting needs a full run (False).
+REASSIGN_ONLY = False
+
+# --- Treatments and plot sets --------------------------------------------------
+# Cells are grouped by the full text of the `treatment` column.
+# Plot sets: each set gets its own summaries, statistics and plots (in a subfolder named after the set
+# when there is more than one set). A set is
+#   None                     -> every treatment
+#   "text"                   -> every treatment whose name contains "text" (case-insensitive)
+#   ["name 1", "name 2", ...] -> exactly these treatments, in this order
+PLOT_SETS = {
+    "all": None,
+    # "2DG": "2DG",
+    # "gluc": ["2.5mM gluc", "0.15mM gluc", "0mM gluc+FCCP+2DG"],
+    # "MMS": "MMS",
+}
+# Order of treatments on the x axis (for sets given as None or "text"). Treatments listed here come
+# first, in this order; the rest follow, sorted by the first number in their name, then alphabetically.
+TREATMENT_ORDER = []
+# Control (reference) treatment per plot set, for the statistics and "% of control".
+# A set without an entry uses its first treatment.
+CONTROLS = {
+    # "gluc": "2.5mM gluc",
+}
 
 # --- Imaging -----------------------------------------------------------------
 INTERVAL_S = 30.0            # seconds between frames
@@ -91,7 +123,7 @@ CELL_DOT_COLOR = "#b0b0b0"   # single cells in the background
 RATE_SCATTER_METRICS = ["k_per_min", "flux_pct_per_min", "slope_pct_per_min"]   # one plot each:
                                     # k (well-fit cells), initial flux and model-free slope (bright cells; export sign flipped)
 RATE_SCATTER_ERROR = "auto"         # "units": SD of experiment+replicate medians; "cells": SD across cells;
-                                    # "auto": units when every dose has >= 2 units, otherwise cells
+                                    # "auto": units when every treatment has >= 2 units, otherwise cells
 
 # --- Per-cell plots ----------------------------------------------------------
 SAVE_CELL_PLOTS = False      # one PNG per cell: trace + fitted exponential (slow for many cells)
@@ -104,6 +136,7 @@ CELL_PLOT_DPI = 100
 
 import glob
 import os
+import re
 import warnings
 from types import SimpleNamespace
 
@@ -120,18 +153,21 @@ warnings.filterwarnings("ignore")
 
 DOSE_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
 REPORTER_COLORS = {"import": "#2a78d6", "export": "#c2410c"}
-# per-dose shades of the reporter colour (light -> dark = low -> high dose) for the dot plots
+# per-treatment shades of the reporter colour (light -> dark along the treatment order) for the dot plots
 SHADES = {"import": ["#6fa5e8", "#4a8fe0", "#2a78d6", "#1c5cab", "#104281"],
           "export": ["#ec9460", "#df6a2c", "#c2410c", "#923109", "#632106"]}
 
 
-def shades(direction, n):
-    ramp = SHADES[direction]
-    if n <= len(ramp):
-        return [ramp[round(i * (len(ramp) - 1) / max(n - 1, 1))] for i in range(n)] if n > 1 else [ramp[2]]
+def ramp(colors, n):
+    if n <= len(colors):
+        return [colors[round(i * (len(colors) - 1) / max(n - 1, 1))] for i in range(n)] if n > 1 else [colors[2]]
     from matplotlib.colors import LinearSegmentedColormap
-    cmap = LinearSegmentedColormap.from_list("r", ramp)
+    cmap = LinearSegmentedColormap.from_list("r", colors)
     return [cmap(i / (n - 1)) for i in range(n)]
+
+
+def shades(direction, n):
+    return ramp(SHADES[direction], n)
 
 
 def settings():
@@ -139,6 +175,10 @@ def settings():
         interval=INTERVAL_S, activation_frame=ACTIVATION_FRAME, min_area=MIN_AREA_PX,
         min_baseline=MIN_BASELINE, bleach=BLEACH_METHOD, bleach_first_frame=BLEACH_FIRST_FRAME,
         slope_frames=SLOPE_FRAMES, gain_time=GAIN_TIME_S, min_r2=MIN_R2, min_amp=MIN_AMPLITUDE)
+
+
+def safe_name(s):
+    return re.sub(r"[^\w.+-]+", "_", str(s)).strip("_")
 
 
 # --------------------------------------------------------------------------- loading
@@ -149,7 +189,27 @@ def find_file(folder, pattern):
     return hits[0]
 
 
-def load(results_path, bg_path, meta_path):
+def load_meta(path, source):
+    """Treatment table: one row per image x treatment (an image may have several treatments)."""
+    meta = pd.read_csv(path).rename(columns={"image": "image_base", "time": "treat_time"})
+    meta["image_base"] = meta["image_base"].astype(str).str.strip()
+    meta["treatment"] = meta["treatment"].astype(str).str.strip()
+    if "replicate" not in meta:
+        meta["replicate"] = "A"
+    meta["replicate"] = meta["replicate"].fillna("A").astype(str).str.strip()
+    dup = meta.duplicated(["image_base", "treatment"])
+    if dup.any():
+        print(f"  Note: {dup.sum()} duplicate image + treatment rows in the meta file were ignored")
+        meta = meta[~dup]
+    reps = meta.groupby("image_base").reporter.nunique()
+    if (reps > 1).any():
+        raise ValueError("An image has more than one reporter in the meta file: "
+                         + ", ".join(reps[reps > 1].index[:5]))
+    meta["source"] = source
+    return meta
+
+
+def load_measurements(results_path, bg_path, meta):
     res = pd.read_csv(results_path)
     res = res.rename(columns={res.columns[0]: "row_id"})
     lab = res["Label"].str.extract(r"^(?P<Image>.+?)_\d+\.tif:(?P<Slice>\d+) - ID (?P<roi>\d+):\d+$")
@@ -161,15 +221,13 @@ def load(results_path, bg_path, meta_path):
     res["image_base"] = res["Image"].str.replace(r"_XY\d+$", "", regex=True)
     res["position"] = res["Image"].str.extract(r"_XY(\d+)$")[0].astype(int)
 
-    meta = pd.read_csv(meta_path).rename(columns={"image": "image_base", "time": "treat_time"})
-    res = res.merge(meta, on="image_base", how="left", validate="many_to_one")
-    if res["treatment"].isna().any():
-        raise ValueError("Images missing from the meta file: "
-                         + ", ".join(res.loc[res.treatment.isna(), "image_base"].unique()[:5]))
-    res["dose_mM"] = res["treatment"].str.extract(r"([\d.]+)\s*mM")[0].astype(float)
-    if "replicate" not in res:
-        res["replicate"] = "A"
-    res["replicate"] = res["replicate"].fillna("A").astype(str)
+    reporter = meta.groupby("image_base").reporter.first()
+    res["reporter"] = res["image_base"].map(reporter)
+    missing = res.loc[res.reporter.isna(), "image_base"].unique()
+    if len(missing):
+        print(f"  Note: {len(missing)} image(s) are not in the meta file and were left out, e.g. {missing[0]}")
+        res = res[res.reporter.notna()]
+    res["reporter"] = res["reporter"].astype(int)
 
     bg = pd.read_csv(bg_path)
     bg["Image"] = bg["Label"].str.replace(r"_\d+\.tif$", "", regex=True)
@@ -180,14 +238,17 @@ def load(results_path, bg_path, meta_path):
     return res
 
 
+def experiment(folder, data_folder=None):
+    """(experiment name, folder with the input files)."""
+    return os.path.basename(os.path.normpath(folder)), data_folder or folder
+
+
 def load_folder(folder, data_folder=None):
-    """Load one experiment. Files are read from data_folder (default: folder); the experiment is
-    named after folder."""
-    data_folder = data_folder or folder
-    raw = load(find_file(data_folder, RESULTS_FILE), find_file(data_folder, BG_FILE),
-               find_file(data_folder, META_FILE))
-    raw["source"] = os.path.basename(os.path.normpath(folder))
-    return raw
+    source, data_folder = experiment(folder, data_folder)
+    meta = load_meta(find_file(data_folder, META_FILE), source)
+    raw = load_measurements(find_file(data_folder, RESULTS_FILE), find_file(data_folder, BG_FILE), meta)
+    raw["source"] = source
+    return raw, meta
 
 
 def filter_rois(df, args):
@@ -196,20 +257,20 @@ def filter_rois(df, args):
     g = df.groupby(["Image", "roi"])
     keep = (g["Slice"].transform("size") == df["n_frames"]) & (g["Area"].transform("min") >= args.min_area)
     out = df[keep].copy()
-    out["cell_id"] = out["reporter"].astype(str) + "_" + out["Image"] + "_" + out["roi"]
-    return out, df.groupby(["Image", "roi"]).ngroups, out["cell_id"].nunique()
+    out["cell_key"] = out["reporter"].astype(str) + "_" + out["Image"] + "_" + out["roi"]
+    return out, df.groupby(["Image", "roi"]).ngroups, out["cell_key"].nunique()
 
 
 def normalise(df, args):
     A = args.activation_frame
-    df = df.sort_values(["cell_id", "Slice"]).copy()
+    df = df.sort_values(["cell_key", "Slice"]).copy()
     df["time"] = (df["Slice"] - 1) * args.interval
     df["Mean_SN"] = df["Mean"] - df["bg_mean"]
     df["Median_SN"] = df["Median"] - df["bg_mean"]
-    pre = df[df["Slice"] <= A].groupby("cell_id")
-    df["pre_mean"] = df["cell_id"].map(pre["Mean"].mean())
-    df["pre_median"] = df["cell_id"].map(pre["Median"].mean())
-    df["pre_bg"] = df["cell_id"].map(pre["bg_mean"].mean())
+    pre = df[df["Slice"] <= A].groupby("cell_key")
+    df["pre_mean"] = df["cell_key"].map(pre["Mean"].mean())
+    df["pre_median"] = df["cell_key"].map(pre["Median"].mean())
+    df["pre_bg"] = df["cell_key"].map(pre["bg_mean"].mean())
     df["norm_mean"] = df["Mean_SN"] / (df["pre_mean"] - df["bg_mean"])
     df["norm_median"] = df["Median_SN"] / (df["pre_median"] - df["bg_mean"])
     df["baseline_bgsub"] = df["pre_mean"] - df["pre_bg"]
@@ -240,7 +301,7 @@ def bleach_rate_preact(df, args):
     out = {}
     sub = df[df.bright & df.Slice.between(args.bleach_first_frame, args.activation_frame)]
     for rep, g in sub.groupby("reporter"):
-        slopes = g.groupby("cell_id").apply(
+        slopes = g.groupby("cell_key").apply(
             lambda c: np.polyfit(c.time, np.log(c.norm_mean.clip(lower=1e-3)), 1)[0])
         b, se = -slopes.mean(), slopes.std() / np.sqrt(len(slopes))
         out[rep] = dict(b_raw=b, b=max(b, 0.0), ci_lo=b - 1.96 * se, ci_hi=b + 1.96 * se, n=len(slopes))
@@ -261,7 +322,7 @@ def bleach_rate_fit(df, args):
 
     out = {}
     for rep, g in df[df.bright].groupby("reporter"):
-        cells = [(c.time.values, c.norm_mean.values) for _, c in g.groupby("cell_id")]
+        cells = [(c.time.values, c.norm_mean.values) for _, c in g.groupby("cell_key")]
         sse = []
         for b in grid:
             f, tot = model(b), 0.0
@@ -285,11 +346,12 @@ def bleach_rate_fit(df, args):
 
 
 def per_cell(df, args, directions):
+    """Per-cell fits and metrics; one row per cell, independent of treatment."""
     t0 = (args.activation_frame - 1) * args.interval
     kmax = 1 / args.interval
     t_slope_end = t0 + args.slope_frames * args.interval
     rows = []
-    for cid, c in df.groupby("cell_id"):
+    for key, c in df.groupby("cell_key"):
         t, y, yc = c.time.values, c.norm_mean.values, c.norm_corr.values
         rep = c.reporter.iloc[0]
         sign = 1 if directions[rep] == "import" else -1
@@ -302,10 +364,8 @@ def per_cell(df, args, directions):
         post = t >= t0
         gain_idx = np.argmin(np.abs(t - args.gain_time))
         rows.append(dict(
-            cell_id=cid, source=c.source.iloc[0], replicate=c.replicate.iloc[0],
-            unit=f"{c.source.iloc[0]}_{c.replicate.iloc[0]}", reporter=rep, direction=directions[rep],
-            treatment=c.treatment.iloc[0], dose_mM=c.dose_mM.iloc[0], image=c.Image.iloc[0],
-            position=c.position.iloc[0], roi=c.roi.iloc[0],
+            cell_key=key, source=c.source.iloc[0], reporter=rep, direction=directions[rep],
+            image=c.Image.iloc[0], image_base=c.image_base.iloc[0], position=c.position.iloc[0], roi=c.roi.iloc[0],
             area_px=c.Area.mean(), baseline_bgsub=c.baseline_bgsub.iloc[0], bright=bool(c.bright.iloc[0]),
             y_inf=yinf, amplitude=amp, k_per_min=k * 60, t_half_s=np.log(2) / k if k > 0 else np.nan, r2=r2,
             flux_pct_per_min=k * amp * 6000,
@@ -320,15 +380,136 @@ def per_cell(df, args, directions):
 
     # plateau-subtracted log fit (well-fit cells): ln((y - y_inf)/(1 - y_inf)) = -k (t - t0)
     lnz = {}
+    by_key = dict(tuple(df.groupby("cell_key")))
     for _, row in r[r.good_fit].iterrows():
-        c = df[df.cell_id == row.cell_id]
+        c = by_key[row.cell_key]
         t, yc = c.time.values, c.norm_corr.values
         z = (yc - row.y_inf) / (1 - row.y_inf)
         m = (t >= t0) & (t <= t0 + LNZ_WINDOW_S[row.direction]) & (z > 0.05)
         if m.sum() >= 3:
-            lnz[row.cell_id] = -np.polyfit(t[m], np.log(z[m]), 1)[0] * 60
-    r["k_lnz_per_min"] = r.cell_id.map(lnz)
+            lnz[row.cell_key] = -np.polyfit(t[m], np.log(z[m]), 1)[0] * 60
+    r["k_lnz_per_min"] = r.cell_key.map(lnz)
     return r
+
+
+TRACE_COLS = ["source", "row_id", "cell_key", "Image", "image_base", "roi", "Slice", "time", "reporter",
+              "position", "Area", "Mean", "StdDev", "Min", "Max", "Median", "IntDen", "bg_mean", "Mean_SN",
+              "Median_SN", "pre_mean", "pre_median", "baseline_bgsub", "bright", "norm_mean", "norm_median",
+              "norm_corr"]
+
+
+def fit_stage(raw, out, args):
+    """Fit every cell once (independent of treatment) and cache the result in <out>/_cache/."""
+    df, n_rois, n_kept = filter_rois(raw, args)
+    df = normalise(df, args)
+    print(f"ROIs: {n_rois} total, {n_kept} kept (full track, area >= {args.min_area:g} px), "
+          f"{df[df.bright].cell_key.nunique()} bright")
+
+    reps = sorted(df.reporter.unique())
+    directions = dict(DIRECTIONS)
+    t0 = (args.activation_frame - 1) * args.interval
+    for rep in reps:
+        if rep not in directions:
+            late = df[(df.reporter == rep) & (df.time > t0)].norm_mean.median()
+            directions[rep] = "import" if late > 1 else "export"
+            print(f"Reporter {rep} not in DIRECTIONS; guessed '{directions[rep]}' from the data")
+
+    # one bleaching rate per experiment (folder) x reporter
+    bleach = {}
+    for src, g in df.groupby("source"):
+        if args.bleach == "preact":
+            est = bleach_rate_preact(g, args)
+        elif args.bleach == "fit":
+            est = bleach_rate_fit(g, args)
+        elif args.bleach == "none":
+            est = {r: dict(b_raw=0.0, b=0.0, ci_lo=np.nan, ci_hi=np.nan, n=0) for r in g.reporter.unique()}
+        else:
+            raise ValueError("BLEACH_METHOD must be 'preact', 'fit' or 'none'")
+        bleach.update({(src, r): v for r, v in est.items()})
+    df["b_per_s"] = [bleach.get(k, {"b": 0.0})["b"] for k in zip(df.source, df.reporter)]
+    t_ref = (args.activation_frame + 1) / 2 * args.interval - args.interval   # mid-baseline time
+    df["norm_corr"] = df.norm_mean * np.exp(df.b_per_s * (df.time - t_ref))
+    bleach_tab = pd.DataFrame([dict(source=src, reporter=r, direction=directions[r], method=args.bleach,
+                                    b_pct_per_min_estimate=v["b_raw"] * 6000, b_pct_per_min_applied=v["b"] * 6000,
+                                    ci_lo=v["ci_lo"] * 6000, ci_hi=v["ci_hi"] * 6000, n_cells=v["n"])
+                               for (src, r), v in bleach.items()])
+
+    fits = per_cell(df, args, directions)
+    traces = df[[k for k in TRACE_COLS if k in df]]
+
+    cache = os.path.join(out, "_cache")
+    os.makedirs(cache, exist_ok=True)
+    fits.to_csv(os.path.join(cache, "cell_fits.csv"), index=False)
+    traces.to_csv(os.path.join(cache, "traces.csv.gz"), index=False)
+    bleach_tab.to_csv(os.path.join(out, "bleach_rates.csv"), index=False)
+    return fits, traces, bleach_tab
+
+
+def load_cache(out):
+    cache = os.path.join(out, "_cache")
+    try:
+        fits = pd.read_csv(os.path.join(cache, "cell_fits.csv"), dtype={"roi": str})
+        traces = pd.read_csv(os.path.join(cache, "traces.csv.gz"), dtype={"roi": str})
+        bleach_tab = pd.read_csv(os.path.join(out, "bleach_rates.csv"))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"No saved fits in {cache}; run once with REASSIGN_ONLY = False first")
+    return fits, traces, bleach_tab
+
+
+# --------------------------------------------------------------------------- assign
+def first_number(name):
+    m = re.search(r"[\d.]+", str(name))
+    try:
+        return float(m.group()) if m else np.inf
+    except ValueError:
+        return np.inf
+
+
+def order_treatments(names, explicit=None):
+    names = list(dict.fromkeys(names))
+    if explicit is not None:
+        return [n for n in explicit if n in names]
+    head = [n for n in TREATMENT_ORDER if n in names]
+    rest = sorted([n for n in names if n not in head], key=lambda n: (first_number(n), n))
+    return head + rest
+
+
+def assign(fits, traces, meta):
+    """Attach treatments: one row per cell x treatment (cells of an image with several treatments
+    are used in each of them)."""
+    m = meta[["source", "image_base", "reporter", "treatment", "replicate"]
+             + [c for c in ["treat_time", "pyruvate"] if c in meta]]
+    check = fits[["source", "image_base", "reporter"]].drop_duplicates().merge(
+        m[["source", "image_base", "reporter"]].drop_duplicates(), on=["source", "image_base"],
+        how="left", suffixes=("", "_meta"))
+    changed = check[check.reporter_meta.notna() & (check.reporter != check.reporter_meta)]
+    if len(changed):
+        raise ValueError("The reporter of some images changed in the meta file (e.g. "
+                         f"{changed.image_base.iloc[0]}); run with REASSIGN_ONLY = False")
+    unassigned = check[check.reporter_meta.isna()].image_base.unique()
+    if len(unassigned):
+        print(f"  Note: {len(unassigned)} image(s) have no treatment in the meta file and were left out, "
+              f"e.g. {unassigned[0]}")
+    m = m.drop(columns="reporter")
+    cells = fits.merge(m, on=["source", "image_base"], how="inner")
+    cells["cell_id"] = cells.cell_key + " | " + cells.treatment
+    cells["unit"] = cells.source + "_" + cells.replicate
+    cells["dose_mM"] = cells.treatment.str.extract(r"([\d.]+)\s*mM")[0].astype(float)
+    tr = traces.merge(m[["source", "image_base", "treatment", "replicate"]], on=["source", "image_base"], how="inner")
+    tr["cell_id"] = tr.cell_key + " | " + tr.treatment
+    n_multi = cells.groupby("cell_key").treatment.nunique().gt(1).sum()
+    if n_multi:
+        print(f"  {n_multi} cells belong to more than one treatment and are used in each")
+    return cells, tr
+
+
+def select(names, spec):
+    """Treatments in a plot set, in plotting order."""
+    if spec is None:
+        return order_treatments(names)
+    if isinstance(spec, str):
+        return order_treatments([n for n in names if spec.lower() in n.lower()])
+    return order_treatments(names, explicit=list(spec))
 
 
 # --------------------------------------------------------------------------- stats
@@ -356,17 +537,22 @@ def stars(p):
     return "ns"
 
 
-def summarise(cells):
+def summarise(cells, conds, control):
     b = cells[cells.bright]
     gf = cells[cells.good_fit]
+    others = [c for c in conds if c != control]
     rows, tests = [], []
     for rep, x in b.groupby("reporter"):
-        ref_flux = x[x.dose_mM == x.dose_mM.min()].flux_pct_per_min.median()
-        for dose, g in x.groupby("dose_mM"):
-            f = gf[(gf.reporter == rep) & (gf.dose_mM == dose)]
+        ref_flux = x[x.treatment == control].flux_pct_per_min.median()
+        for cond in conds:
+            g = x[x.treatment == cond]
+            if g.empty:
+                continue
+            f = gf[(gf.reporter == rep) & (gf.treatment == cond)]
             rows.append(dict(
-                reporter=rep, direction=g.direction.iloc[0], dose_mM=dose, n_bright=len(g),
-                n_fields=g.image.nunique(), n_good_fit=len(f), pct_good_fit=100 * len(f) / len(g), pct_responders=100 * g.responder.mean(),
+                reporter=rep, direction=g.direction.iloc[0], treatment=cond, is_control=cond == control,
+                n_bright=len(g), n_fields=g.image.nunique(), n_good_fit=len(f), pct_good_fit=100 * len(f) / len(g),
+                pct_responders=100 * g.responder.mean(),
                 flux_median=g.flux_pct_per_min.median(), flux_pct_of_control=100 * g.flux_pct_per_min.median() / ref_flux,
                 flux_uncorrected_median=g.flux_uncorrected_pct_per_min.median(),
                 slope_median=g.slope_pct_per_min.median(), gain_median=g.gain_at_t.median(),
@@ -376,54 +562,64 @@ def summarise(cells):
         for col in STAT_METRICS:
             xx = gf[gf.reporter == rep] if col in GOODFIT_METRICS else x
             cells_used = "well-fit" if col in GOODFIT_METRICS else "bright"
-            doses = sorted(xx.dose_mM.unique())
-            groups = [xx[xx.dose_mM == d][col].dropna() for d in doses]
-            if len(doses) < 2 or any(len(g) < 2 for g in groups):
+            present = [c for c in conds if (xx.treatment == c).any()]
+            groups = {c: xx[xx.treatment == c][col].dropna() for c in present}
+            if control not in groups or len(present) < 2 or any(len(g) < 2 for g in groups.values()):
                 continue
-            kw = stats.kruskal(*groups).pvalue
-            fields = xx.groupby(["dose_mM", "image"])[col].median().reset_index()
-            fgroups = [g[col].dropna() for _, g in fields.groupby("dose_mM")]
+            kw = stats.kruskal(*groups.values()).pvalue
+            fields = xx.groupby(["treatment", "image"])[col].median().reset_index()
+            fgroups = [g[col].dropna() for _, g in fields.groupby("treatment")]
             kwf = stats.kruskal(*fgroups).pvalue if all(len(g) >= 2 for g in fgroups) else np.nan
-            ctrl = groups[0]
-            ps = [stats.mannwhitneyu(ctrl, g).pvalue for g in groups[1:]]
-            for d, g, p, pa in zip(doses[1:], groups[1:], ps, holm(ps)):
-                tests.append(dict(reporter=rep, metric=col, cells=cells_used, test=f"Mann-Whitney vs {doses[0]:g} mM",
-                                  dose_mM=d, n_control=len(ctrl), n_dose=len(g), p=p, p_holm=pa, stars=stars(pa)))
+            comp = [c for c in others if c in groups]
+            ps = [stats.mannwhitneyu(groups[control], groups[c]).pvalue for c in comp]
+            for c, p, pa in zip(comp, ps, holm(ps)):
+                tests.append(dict(reporter=rep, metric=col, cells=cells_used, test=f"Mann-Whitney vs {control}",
+                                  treatment=c, n_control=len(groups[control]), n_treatment=len(groups[c]),
+                                  p=p, p_holm=pa, stars=stars(pa)))
             tests.append(dict(reporter=rep, metric=col, cells=cells_used, test="Kruskal-Wallis (cells)",
-                              dose_mM=np.nan, p=kw, stars=stars(kw)))
+                              treatment=np.nan, p=kw, stars=stars(kw)))
             tests.append(dict(reporter=rep, metric=col, cells=cells_used, test="Kruskal-Wallis (field medians)",
-                              dose_mM=np.nan, p=kwf, stars=stars(kwf)))
-        # fraction of bright cells that are well-fit: Fisher's exact test vs control, chi-square across doses
-        doses = sorted(x.dose_mM.unique())
-        table = [[int(x[x.dose_mM == d].good_fit.sum()), int((~x[x.dose_mM == d].good_fit).sum())] for d in doses]
-        if len(doses) > 1:
-            ps = [stats.fisher_exact([table[0], t])[1] for t in table[1:]]
-            for d, t, p, pa in zip(doses[1:], table[1:], ps, holm(ps)):
+                              treatment=np.nan, p=kwf, stars=stars(kwf)))
+        # fraction of bright cells that are well-fit: Fisher's exact test vs control, chi-square across treatments
+        present = [c for c in conds if (x.treatment == c).any()]
+        if control in present and len(present) > 1:
+            table = {c: [int(x[x.treatment == c].good_fit.sum()), int((~x[x.treatment == c].good_fit).sum())]
+                     for c in present}
+            comp = [c for c in others if c in table]
+            ps = [stats.fisher_exact([table[control], table[c]])[1] for c in comp]
+            for c, p, pa in zip(comp, ps, holm(ps)):
                 tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright",
-                                  test=f"Fisher exact vs {doses[0]:g} mM", dose_mM=d, n_control=sum(table[0]),
-                                  n_dose=sum(t), p=p, p_holm=pa, stars=stars(pa)))
-            chi = stats.chi2_contingency(table)[1] if min(map(sum, zip(*table))) > 0 else np.nan
-            tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright", test="Chi-square (doses)",
-                              dose_mM=np.nan, p=chi, stars=stars(chi)))
-    return pd.DataFrame(rows), pd.DataFrame(tests)
+                                  test=f"Fisher exact vs {control}", treatment=c, n_control=sum(table[control]),
+                                  n_treatment=sum(table[c]), p=p, p_holm=pa, stars=stars(pa)))
+            tab = list(table.values())
+            chi = stats.chi2_contingency(tab)[1] if min(map(sum, zip(*tab))) > 0 else np.nan
+            tests.append(dict(reporter=rep, metric="pct_good_fit", cells="bright", test="Chi-square (treatments)",
+                              treatment=np.nan, p=chi, stars=stars(chi)))
+    tests = pd.DataFrame(tests)
+    if tests.empty:
+        tests = pd.DataFrame(columns=["reporter", "metric", "cells", "test", "treatment", "n_control",
+                                      "n_treatment", "p", "p_holm", "stars"])
+    return pd.DataFrame(rows), tests
 
 
-def timecourse_tables(df):
-    """Mean / SD / SEM / n per reporter x dose x time, bright cells, bleach-corrected and uncorrected."""
+def timecourse_tables(df, conds):
+    """Mean / SD / SEM / n per reporter x treatment x time, bright cells, bleach-corrected and uncorrected."""
     b = df[df.bright]
-    long = (b.groupby(["reporter", "dose_mM", "time"])
+    long = (b.groupby(["reporter", "treatment", "time"])
              .agg(n=("norm_corr", "size"), mean_corr=("norm_corr", "mean"), sd_corr=("norm_corr", "std"),
                   mean_uncorr=("norm_mean", "mean"), sd_uncorr=("norm_mean", "std"))
              .reset_index())
     long["sem_corr"] = long.sd_corr / np.sqrt(long.n)
     long["sem_uncorr"] = long.sd_uncorr / np.sqrt(long.n)
-    long = long[["reporter", "dose_mM", "time", "n", "mean_corr", "sd_corr", "sem_corr",
-                 "mean_uncorr", "sd_uncorr", "sem_uncorr"]]
+    long["order"] = long.treatment.map({c: i for i, c in enumerate(conds)})
+    long = long.sort_values(["reporter", "order", "time"])[
+        ["reporter", "treatment", "time", "n", "mean_corr", "sd_corr", "sem_corr",
+         "mean_uncorr", "sd_uncorr", "sem_uncorr"]]
     wide = {}
     for rep, g in long.groupby("reporter"):
-        w = g.pivot(index="time", columns="dose_mM", values=["mean_corr", "sd_corr", "sem_corr", "n"])
-        w.columns = [f"{d:g}mM_{v.replace('_corr', '')}" for v, d in w.columns]
-        order = [f"{d:g}mM_{v}" for d in sorted(g.dose_mM.unique()) for v in ["mean", "sd", "sem", "n"]]
+        w = g.pivot(index="time", columns="treatment", values=["mean_corr", "sd_corr", "sem_corr", "n"])
+        w.columns = [f"{c}_{v.replace('_corr', '')}" for v, c in w.columns]
+        order = [f"{c}_{v}" for c in conds if (g.treatment == c).any() for v in ["mean", "sd", "sem", "n"]]
         wide[rep] = w[order].reset_index()
     return long, wide
 
@@ -436,8 +632,15 @@ def style(ax):
     ax.set_axisbelow(True)
 
 
-def dose_colors(doses):
-    return {d: DOSE_COLORS[min(i, len(DOSE_COLORS) - 1)] for i, d in enumerate(sorted(doses))}
+def cond_colors(conds):
+    return dict(zip(conds, ramp(DOSE_COLORS, len(conds))))
+
+
+def set_cond_ticks(ax, labels):
+    long = max((len(s.split("\n")[0]) for s in labels), default=0) > 9
+    ax.set_xticks(range(len(labels)), labels, fontsize=8, rotation=30 if long else 0,
+                  ha="right" if long else "center")
+    ax.set_xlabel("treatment")
 
 
 def save(fig, path):
@@ -446,23 +649,26 @@ def save(fig, path):
     plt.close(fig)
 
 
-def fig_timecourse(df, rep, direction, args, path, err="sem"):
+def fig_timecourse(df, conds, rep, direction, args, path, err="sem"):
     t0 = (args.activation_frame - 1) * args.interval
-    fig, ax = plt.subplots(figsize=(6, 4.3))
+    fig, ax = plt.subplots(figsize=(6.4, 4.3))
     x = df[(df.reporter == rep) & df.bright]
-    cols = dose_colors(x.dose_mM.unique())
-    for dose, g in x.groupby("dose_mM"):
+    cols = cond_colors(conds)
+    for cond in conds:
+        g = x[x.treatment == cond]
+        if g.empty:
+            continue
         m = g.groupby("time").norm_corr.agg(["mean", {"sd": "std"}.get(err, err)])
         e = m.iloc[:, 1]
-        ax.fill_between(m.index, m["mean"] - e, m["mean"] + e, color=cols[dose], alpha=.18, lw=0)
-        ax.plot(m.index, m["mean"], color=cols[dose], lw=2, label=f"{dose:g} mM (n={g.cell_id.nunique()})")
+        ax.fill_between(m.index, m["mean"] - e, m["mean"] + e, color=cols[cond], alpha=.18, lw=0)
+        ax.plot(m.index, m["mean"], color=cols[cond], lw=2, label=f"{cond} (n={g.cell_id.nunique()})")
     ax.axhline(1, color="#999", lw=.8, ls="--")
     ax.axvspan(0, t0, color="#eee", zorder=0)
     ax.set_title(f"Reporter {rep} ({direction}): mean ± {err.upper()}, bright cells\n(grey = pre-activation)",
                  loc="left", fontsize=10)
     ax.set_xlabel("time (s)")
     ax.set_ylabel("nuclear signal / baseline")
-    ax.legend(frameon=False, fontsize=8)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))
     style(ax)
     save(fig, path)
 
@@ -470,15 +676,15 @@ def fig_timecourse(df, rep, direction, args, path, err="sem"):
 UNIT_MARKERS = ["o", "s", "^", "D", "v", "P", "X", "<", ">"]
 
 
-def strip(ax, x, col, doses, colors, fmt="{:.1f}", clip=None):
-    """Superplot: every cell as a small grey dot, an unfilled box per dose, and the median of
+def strip(ax, x, col, conds, colors, fmt="{:.1f}", clip=None):
+    """Superplot: every cell as a small grey dot, an unfilled box per treatment, and the median of
     each experiment + replicate as a large dot (marker shape = experiment + replicate)."""
     rng = np.random.default_rng(1)
     units = sorted(x.unit.unique())
     markers = {u: UNIT_MARKERS[i % len(UNIT_MARKERS)] for i, u in enumerate(units)}
-    for i, d in enumerate(doses):
+    for i, cond in enumerate(conds):
         color = colors[i]
-        g = x[(x.dose_mM == d) & x[col].notna()]
+        g = x[(x.treatment == cond) & x[col].notna()]
         if len(g) == 0:
             continue
         v = g[col].values
@@ -498,42 +704,37 @@ def strip(ax, x, col, doses, colors, fmt="{:.1f}", clip=None):
         ax.legend([Line2D([], [], ls="", marker=markers[u], color="#555", ms=6) for u in units], units,
                   frameon=False, fontsize=7, title="experiment_replicate median", title_fontsize=7,
                   loc="upper left", bbox_to_anchor=(1.01, 1))
-    ax.set_xticks(range(len(doses)), [f"{d:g}\n(n={x[x.dose_mM == d][col].notna().sum()})" for d in doses],
-                  fontsize=8)
-    ax.set_xlabel("2DG (mM)")
+    ax.set_xlim(-.6, len(conds) - .4)
+    set_cond_ticks(ax, [f"{c}\n(n={x[x.treatment == c][col].notna().sum()})" for c in conds])
     style(ax)
 
 
-def add_stars(ax, tests, rep, metric, doses):
+def add_stars(ax, tests, rep, metric, conds, control):
     if not SHOW_STARS or tests.empty:
         return
     t = tests[(tests.reporter == rep) & (tests.metric == metric)]
     if t.empty:
         return
     lo, hi = ax.get_ylim()
-    for i, d in enumerate(doses):
-        s = t[t.dose_mM == d]
+    for i, cond in enumerate(conds):
+        s = t[t.treatment == cond]
         if len(s):
             ax.text(i, hi - 0.03 * (hi - lo), s.stars.iloc[0], ha="center", va="top", fontsize=10, color="#222")
-    pair = t[t.p_holm.notna()].test.iloc[0].split(" vs ")[0]
-    kw = t[t.test.isin(["Kruskal-Wallis (cells)", "Chi-square (doses)"])]
-    note = f"Stars: {pair} vs {doses[0]:g} mM, Holm-adjusted"
+    pair = t[t.p_holm.notna()].test.iloc[0].split(" vs ")[0] if t.p_holm.notna().any() else "test"
+    kw = t[t.test.isin(["Kruskal-Wallis (cells)", "Chi-square (treatments)"])]
+    note = f"Stars: {pair} vs {control}, Holm-adjusted"
     if len(kw):
         note += f"   {kw.test.iloc[0].split(' (')[0]} p = {kw.p.iloc[0]:.2g}"
     ax.annotate(note, xy=(0, 0), xycoords="figure fraction", xytext=(6, 4), textcoords="offset points",
                 fontsize=7, color="#666")
 
 
-def fig_metric(cells, tests, rep, direction, metric, title, ylabel, path, goodfit=False,
-               fmt="{:.1f}", clip=None, zero_line=True, robust_ylim=False):
+def fig_metric(cells, tests, conds, control, rep, direction, metric, title, ylabel, path, goodfit=False,
+               fmt="{:.1f}", clip=None, zero_line=True):
     x = cells[cells.good_fit if goodfit else cells.bright]
     x = x[x.reporter == rep]
-    doses = sorted(cells[cells.reporter == rep].dose_mM.unique())
-    fig, ax = plt.subplots(figsize=(6, 4.8))
-    strip(ax, x, metric, doses, shades(direction, len(doses)), fmt=fmt, clip=clip)
-    if robust_ylim and x[metric].notna().any():
-        lo, hi = np.percentile(x[metric].dropna(), [1, 99])
-        ax.set_ylim(min(lo, 0) * 1.1, max(hi, 0) * 1.1)
+    fig, ax = plt.subplots(figsize=(max(6, 1 + 1.0 * len(conds)), 5))
+    strip(ax, x, metric, conds, shades(direction, len(conds)), fmt=fmt, clip=clip)
     lo, hi = ax.get_ylim()
     ax.set_ylim(lo, hi + 0.12 * (hi - lo))            # headroom for stars
     if zero_line:
@@ -541,24 +742,23 @@ def fig_metric(cells, tests, rep, direction, metric, title, ylabel, path, goodfi
     ax.set_title(title, loc="left", fontsize=10)
     ax.set_ylabel(ylabel)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
-    add_stars(ax, tests, rep, metric, doses)
+    add_stars(ax, tests, rep, metric, conds, control)
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
-def fig_pct_goodfit(cells, tests, rep, direction, args, path):
-    """% of bright cells that pass the well-fit criteria, per dose."""
+def fig_pct_goodfit(cells, tests, conds, control, rep, direction, args, path):
+    """% of bright cells that pass the well-fit criteria, per treatment."""
     x = cells[cells.bright & (cells.reporter == rep)]
-    doses = sorted(x.dose_mM.unique())
-    k = np.array([x[x.dose_mM == d].good_fit.sum() for d in doses])
-    n = np.array([(x.dose_mM == d).sum() for d in doses])
-    pct = 100 * k / n
-    fig, ax = plt.subplots(figsize=(6, 4.8))
-    ax.bar(range(len(doses)), pct, 0.6, color=REPORTER_COLORS[direction])
-    for i in range(len(doses)):
-        ax.text(i, pct[i] + 1.5, f"{pct[i]:.0f}%\n({k[i]}/{n[i]})", ha="center", va="bottom", fontsize=8)
-    ax.set_xticks(range(len(doses)), [f"{d:g}" for d in doses])
-    ax.set_xlabel("2DG (mM)")
+    k = np.array([x[x.treatment == c].good_fit.sum() for c in conds])
+    n = np.array([(x.treatment == c).sum() for c in conds])
+    pct = np.where(n > 0, 100 * k / np.maximum(n, 1), np.nan)
+    fig, ax = plt.subplots(figsize=(max(6, 1 + 1.0 * len(conds)), 5))
+    ax.bar(range(len(conds)), pct, 0.6, color=REPORTER_COLORS[direction])
+    for i in range(len(conds)):
+        if n[i]:
+            ax.text(i, pct[i] + 1.5, f"{pct[i]:.0f}%\n({k[i]}/{n[i]})", ha="center", va="bottom", fontsize=8)
+    set_cond_ticks(ax, conds)
     ax.set_ylabel("well-fit cells (% of bright cells)")
     ax.set_ylim(0, 125)
     ax.set_yticks(range(0, 101, 20))
@@ -566,29 +766,32 @@ def fig_pct_goodfit(cells, tests, rep, direction, args, path):
                  f"expected direction, k not at a bound)", loc="left", fontsize=10)
     style(ax)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
-    add_stars(ax, tests, rep, "pct_good_fit", doses)
+    add_stars(ax, tests, rep, "pct_good_fit", conds, control)
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
-def fig_logfits(df, cells, rep, direction, args, path):
+def fig_logfits(df, cells, conds, rep, direction, args, path):
     t0 = (args.activation_frame - 1) * args.interval
     gf = cells[cells.good_fit].set_index("cell_id")
-    fig, axs = plt.subplots(2, 1, figsize=(6, 8.4))
+    fig, axs = plt.subplots(2, 1, figsize=(6.4, 8.4))
     x = df[(df.reporter == rep) & df.bright & (df.time >= t0)].copy()
-    cols = dose_colors(x.dose_mM.unique())
+    cols = cond_colors(conds)
     x["ln"] = np.log(x.norm_corr.clip(lower=1e-3))
     ax = axs[0]
-    for dose, g in x.groupby("dose_mM"):
+    for cond in conds:
+        g = x[x.treatment == cond]
+        if g.empty:
+            continue
         m = g.groupby("time").ln.agg(["mean", "sem"])
-        ax.errorbar(m.index, m["mean"], yerr=m["sem"], fmt="o", ms=3, color=cols[dose], lw=1, label=f"{dose:g} mM")
+        ax.errorbar(m.index, m["mean"], yerr=m["sem"], fmt="o", ms=3, color=cols[cond], lw=1, label=cond)
         e = m[m.index <= t0 + args.slope_frames * args.interval]
         p = np.polyfit(e.index, e["mean"], 1)
         tt = np.linspace(t0, m.index.max(), 30)
-        ax.plot(tt, np.polyval(p, tt), color=cols[dose], lw=1, ls="--")
+        ax.plot(tt, np.polyval(p, tt), color=cols[cond], lw=1, ls="--")
     ax.axhline(0, color="#999", lw=.8)
     ax.set_title(f"{rep} ({direction}): ln(norm); dashed = early-window fit", loc="left", fontsize=10)
-    ax.legend(frameon=False, fontsize=8)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))
     style(ax)
     ax = axs[1]
     y = x[x.cell_id.isin(gf.index) & (x.time <= t0 + LNZ_WINDOW_S[direction])].copy()
@@ -596,59 +799,59 @@ def fig_logfits(df, cells, rep, direction, args, path):
     y["z"] = (y.norm_corr - y.yinf) / (1 - y.yinf)
     y = y[y.z > 0.05]
     y["lnz"] = np.log(y.z)
-    for dose, g in y.groupby("dose_mM"):
+    for cond in conds:
+        g = y[y.treatment == cond]
         m = g.groupby("time").lnz.agg(["mean", "sem", "size"])
         m = m[m["size"] >= 5]
         if len(m) < 2:
             continue
-        ax.errorbar(m.index, m["mean"], yerr=m["sem"], fmt="o", ms=3, color=cols[dose], lw=1,
-                    label=f"{dose:g} mM (n={g.cell_id.nunique()})")
+        ax.errorbar(m.index, m["mean"], yerr=m["sem"], fmt="o", ms=3, color=cols[cond], lw=1,
+                    label=f"{cond} (n={g.cell_id.nunique()})")
         p = np.polyfit(m.index, m["mean"], 1)
-        ax.plot(m.index, np.polyval(p, m.index), color=cols[dose], lw=1.2)
+        ax.plot(m.index, np.polyval(p, m.index), color=cols[cond], lw=1.2)
     ax.axhline(0, color="#999", lw=.8)
     ax.set_title(f"{rep}: ln((norm − plateau)/(1 − plateau)), well-fit cells; slope = −k", loc="left", fontsize=10)
     ax.set_xlabel("time (s)")
-    ax.legend(frameon=False, fontsize=8)
+    ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))
     style(ax)
     save(fig, path)
 
 
-def fig_bleach(bleach, cells, reps, directions, args, path):
-    fig, axs = plt.subplots(1, 1 + len(reps), figsize=(5 + 5.5 * len(reps), 4.4), squeeze=False)
+def fig_bleach(bleach_tab, cells, conds, control, reps, directions, args, path):
+    fig, axs = plt.subplots(1, 1 + len(reps), figsize=(5 + max(5.5, 1 + .9 * len(conds)) * len(reps), 4.6),
+                            squeeze=False)
     ax = axs[0][0]
-    keys = sorted(bleach, key=lambda k: (k[1], k[0]))
-    multi = len({k[0] for k in keys}) > 1
-    for i, (src, rep) in enumerate(keys):
-        bb = bleach[(src, rep)]
-        c = REPORTER_COLORS[directions[rep]]
-        yerr = None if np.isnan(bb["ci_lo"]) else [[bb["b_raw"] * 6000 - bb["ci_lo"] * 6000],
-                                                     [bb["ci_hi"] * 6000 - bb["b_raw"] * 6000]]
-        ax.errorbar(i, bb["b_raw"] * 6000, yerr=yerr, fmt="o", color=c, ms=8, capsize=4)
-        ax.text(i + .08, bb["b_raw"] * 6000, f"{bb['b_raw'] * 6000:.2f}", fontsize=8, va="center")
+    bt = bleach_tab.sort_values(["reporter", "source"]).reset_index(drop=True)
+    multi = bt.source.nunique() > 1
+    for i, r in bt.iterrows():
+        c = REPORTER_COLORS[directions[r.reporter]]
+        b = r.b_pct_per_min_estimate
+        yerr = None if np.isnan(r.ci_lo) else [[b - r.ci_lo], [r.ci_hi - b]]
+        ax.errorbar(i, b, yerr=yerr, fmt="o", color=c, ms=8, capsize=4)
+        ax.text(i + .08, b, f"{b:.2f}", fontsize=8, va="center")
     ax.axhline(0, color="#999", lw=.8)
-    ax.set_xticks(range(len(keys)), [f"{r}\n{src}" if multi else f"{r} ({directions[r]})" for src, r in keys],
-                  fontsize=8 if multi else 10)
-    ax.set_xlim(-.5, len(keys) - .5)
+    ax.set_xticks(range(len(bt)), [f"{r.reporter}\n{r.source}" if multi else f"{r.reporter} ({directions[r.reporter]})"
+                                   for r in bt.itertuples()], fontsize=8 if multi else 10)
+    ax.set_xlim(-.5, len(bt) - .5)
     ax.set_ylabel("bleaching rate b (% per min)")
     ax.set_title(f"Bleaching rate per {'experiment × ' if multi else ''}reporter ({args.bleach})", loc="left", fontsize=10)
     style(ax)
     b = cells[cells.bright]
     for ax, rep in zip(axs[0][1:], reps):
         x = b[b.reporter == rep]
-        doses = sorted(x.dose_mM.unique())
         w = .38
         for k, (col, lab, alpha) in enumerate([("flux_uncorrected_pct_per_min", "uncorrected", .35),
                                                ("flux_pct_per_min", "bleach-corrected", .9)]):
-            med = x.groupby("dose_mM")[col].median().reindex(doses)
-            pct = med / med.iloc[0] * 100
-            ax.bar(np.arange(len(doses)) + (k - .5) * w, pct, w * .95, color=REPORTER_COLORS[directions[rep]],
+            med = x.groupby("treatment")[col].median().reindex(conds)
+            pct = med / med.get(control, np.nan) * 100
+            ax.bar(np.arange(len(conds)) + (k - .5) * w, pct, w * .95, color=REPORTER_COLORS[directions[rep]],
                    alpha=alpha, label=lab)
             for i, v in enumerate(pct):
-                ax.text(i + (k - .5) * w, v + 1.5, f"{v:.0f}", ha="center", fontsize=7.5)
-        ax.set_xticks(range(len(doses)), [f"{d:g}" for d in doses])
-        ax.set_xlabel("2DG (mM)")
-        ax.set_ylim(0, 125)
-        ax.set_title(f"{rep}: median initial flux, % of control", loc="left", fontsize=10)
+                if np.isfinite(v):
+                    ax.text(i + (k - .5) * w, max(v, 0) + 1.5, f"{v:.0f}", ha="center", fontsize=7.5)
+        set_cond_ticks(ax, conds)
+        ax.set_ylim(min(0, ax.get_ylim()[0]), max(125, ax.get_ylim()[1]))
+        ax.set_title(f"{rep}: median initial flux, % of {control}", loc="left", fontsize=10)
         ax.legend(frameon=False, fontsize=8)
         style(ax)
     save(fig, path)
@@ -659,9 +862,9 @@ RATE_NAMES = {"k_per_min": ("k", "per min", "k"),
               "slope_pct_per_min": ("model-free slope", "% of baseline per min", "slope")}
 
 
-def fig_rate_scatter(cells, directions, metric, path):
-    """Export rate (x) vs import rate (y) per dose. Faint dots: median of each experiment + replicate
-    (import and export paired by experiment, replicate and dose). Large dot: mean of those medians
+def fig_rate_scatter(cells, conds, directions, metric, path):
+    """Export rate (x) vs import rate (y) per treatment. Faint dots: median of each experiment + replicate
+    (import and export paired by experiment, replicate and treatment). Large dot: mean of those medians
     (or the cell median when error = cells) with ± SD error bars."""
     imp = [r for r, d in directions.items() if d == "import" and r in set(cells.reporter)]
     exp = [r for r, d in directions.items() if d == "export" and r in set(cells.reporter)]
@@ -673,26 +876,28 @@ def fig_rate_scatter(cells, directions, metric, path):
     # import cell's slightly negative value into a positive rate and inflate the median)
     c["v"] = np.where(c.direction == "export", -c[metric], c[metric]) if metric != "k_per_min" else c[metric]
     xi, xe = c[c.reporter == imp[0]], c[c.reporter == exp[0]]
-    ui = xi.groupby(["dose_mM", "unit"]).v.median()
-    ue = xe.groupby(["dose_mM", "unit"]).v.median()
+    ui = xi.groupby(["treatment", "unit"]).v.median()
+    ue = xe.groupby(["treatment", "unit"]).v.median()
     units = pd.concat([ue.rename("x"), ui.rename("y")], axis=1).dropna().reset_index()
-    doses = sorted(set(xi.dose_mM) & set(xe.dose_mM))
+    both = [cd for cd in conds if (xi.treatment == cd).any() and (xe.treatment == cd).any()]
+    if not both:
+        return False
     err = RATE_SCATTER_ERROR
     if err == "auto":
-        err = "units" if all((units.dose_mM == d).sum() >= 2 for d in doses) else "cells"
-    cols = dose_colors(doses)
+        err = "units" if all((units.treatment == cd).sum() >= 2 for cd in both) else "cells"
+    cols = cond_colors(conds)
     name, unit_label, _ = RATE_NAMES[metric]
-    fig, ax = plt.subplots(figsize=(6.4, 4.6))
-    for d in doses:
-        u = units[units.dose_mM == d]
-        ax.scatter(u.x, u.y, s=40, color=cols[d], alpha=.35, lw=0, zorder=2)
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    for cd in both:
+        u = units[units.treatment == cd]
+        ax.scatter(u.x, u.y, s=40, color=cols[cd], alpha=.35, lw=0, zorder=2)
         if err == "units":
             mx, my, sx, sy = u.x.mean(), u.y.mean(), u.x.std(), u.y.std()
         else:
-            ve, vi = xe[xe.dose_mM == d].v, xi[xi.dose_mM == d].v
+            ve, vi = xe[xe.treatment == cd].v, xi[xi.treatment == cd].v
             mx, my, sx, sy = ve.median(), vi.median(), ve.std(), vi.std()
-        ax.errorbar(mx, my, xerr=sx, yerr=sy, fmt="o", ms=8, color=cols[d], ecolor=cols[d], elinewidth=1.3,
-                    capsize=4, zorder=3, label=f"{d:g} mM 2DG")
+        ax.errorbar(mx, my, xerr=sx, yerr=sy, fmt="o", ms=8, color=cols[cd], ecolor=cols[cd], elinewidth=1.3,
+                    capsize=4, zorder=3, label=cd)
     ax.set_xlim(left=min(0, ax.get_xlim()[0]))      # include 0 without hiding error bars below it
     ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
     ax.set_xlabel(f"export rate, {name} ({unit_label})")
@@ -708,17 +913,20 @@ def fig_rate_scatter(cells, directions, metric, path):
     return True
 
 
-def cell_plots(df, cells, args, outdir):
-    """One PNG per cell: normalised and bleach-corrected trace with the fitted exponential."""
+def cell_plots(traces, cells, args, outdir):
+    """One PNG per cell: normalised and bleach-corrected trace with the fitted exponential.
+    Saved under <reporter>_<treatment>/; a cell in several treatments is saved in each folder."""
     t0 = (args.activation_frame - 1) * args.interval
-    info = cells.set_index("cell_id")
+    info = cells.drop_duplicates("cell_key").set_index("cell_key")
+    folders = cells.groupby("cell_key").apply(
+        lambda g: [f"{r}_{safe_name(t)}" for r, t in zip(g.reporter, g.treatment)])
     if CELL_PLOTS_BRIGHT_ONLY:
-        df = df[df.bright]
+        traces = traces[traces.bright]
     n = 0
-    for cid, c in df.groupby("cell_id"):
-        r = info.loc[cid]
-        sub = os.path.join(outdir, f"{r.reporter}_{r.dose_mM:g}mM")
-        os.makedirs(sub, exist_ok=True)
+    for key, c in traces.drop_duplicates(["cell_key", "Slice"]).groupby("cell_key"):
+        if key not in info.index:
+            continue
+        r = info.loc[key]
         fig, ax = plt.subplots(figsize=(5, 3.6))
         ax.axvspan(0, t0, color="#eee", zorder=0)
         ax.plot(c.time, c.norm_mean, "o", ms=3, color="#aaa", label="normalised")
@@ -729,7 +937,8 @@ def cell_plots(df, cells, args, outdir):
         ax.axhline(1, color="#999", lw=.8, ls="--")
         verdict = ("well-fit" if r.good_fit else "dim" if not r.bright else
                    "non-responder" if not r.responder else "k at bound" if r.k_at_bound else "low R²")
-        ax.set_title(f"{os.path.basename(r.image)} ROI {r.roi}  ({r.reporter}, {r.dose_mM:g} mM)\n"
+        treat = ", ".join(cells[cells.cell_key == key].treatment)
+        ax.set_title(f"{os.path.basename(r.image)} ROI {r.roi}  ({r.reporter}; {treat})\n"
                      f"flux {r.flux_pct_per_min:.1f} %/min · amp {r.amplitude:.2f} · "
                      f"t½ {r.t_half_s:.0f} s · R² {r.r2:.2f} · {verdict}", loc="left", fontsize=8)
         ax.set_xlabel("time (s)")
@@ -737,68 +946,41 @@ def cell_plots(df, cells, args, outdir):
         ax.legend(frameon=False, fontsize=7)
         style(ax)
         fig.tight_layout()
-        fig.savefig(os.path.join(sub, f"{r.image.replace('/', '_')}_ROI{r.roi}.png"), dpi=CELL_PLOT_DPI)
+        for sub in folders[key]:
+            os.makedirs(os.path.join(outdir, sub), exist_ok=True)
+            fig.savefig(os.path.join(outdir, sub, f"{r.image.replace('/', '_')}_ROI{r.roi}.png"), dpi=CELL_PLOT_DPI)
         plt.close(fig)
         n += 1
     return n
 
 
-# --------------------------------------------------------------------------- run
-def analyse(raw, out, args):
+# --------------------------------------------------------------------------- report
+def report(cells, tr, bleach_tab, conds, control, directions, args, out):
+    """Summaries, statistics and plots for one plot set."""
     os.makedirs(out, exist_ok=True)
-    df, n_rois, n_kept = filter_rois(raw, args)
-    df = normalise(df, args)
-    print(f"ROIs: {n_rois} total, {n_kept} kept (full track, area >= {args.min_area:g} px), "
-          f"{df[df.bright].cell_id.nunique()} bright")
+    cells = cells[cells.treatment.isin(conds)]
+    tr = tr[tr.treatment.isin(conds)]
+    reps = sorted(cells.reporter.unique())
+    summary, tests = summarise(cells, conds, control)
+    tc_long, tc_wide = timecourse_tables(tr, conds)
 
-    reps = sorted(df.reporter.unique())
-    directions = dict(DIRECTIONS)
-    t0 = (args.activation_frame - 1) * args.interval
-    for rep in reps:
-        if rep not in directions:
-            late = df[(df.reporter == rep) & (df.time > t0)].norm_mean.median()
-            directions[rep] = "import" if late > 1 else "export"
-            print(f"Reporter {rep} not in DIRECTIONS; guessed '{directions[rep]}' from the data")
-
-    # one bleaching rate per experiment (folder) x reporter
-    bleach = {}
-    for src, g in df.groupby("source"):
-        if args.bleach == "preact":
-            est = bleach_rate_preact(g, args)
-        elif args.bleach == "fit":
-            est = bleach_rate_fit(g, args)
-        elif args.bleach == "none":
-            est = {r: dict(b_raw=0.0, b=0.0, ci_lo=np.nan, ci_hi=np.nan, n=0) for r in g.reporter.unique()}
-        else:
-            raise ValueError("BLEACH_METHOD must be 'preact', 'fit' or 'none'")
-        bleach.update({(src, r): v for r, v in est.items()})
-    df["b_per_s"] = [bleach.get(k, {"b": 0.0})["b"] for k in zip(df.source, df.reporter)]
-    t_ref = (args.activation_frame + 1) / 2 * args.interval - args.interval   # mid-baseline time
-    df["norm_corr"] = df.norm_mean * np.exp(df.b_per_s * (df.time - t_ref))
-    pd.DataFrame([dict(source=src, reporter=r, method=args.bleach, b_pct_per_min_estimate=v["b_raw"] * 6000,
-                       b_pct_per_min_applied=v["b"] * 6000, ci_lo=v["ci_lo"] * 6000, ci_hi=v["ci_hi"] * 6000,
-                       n_cells=v["n"]) for (src, r), v in bleach.items()]).to_csv(
-        os.path.join(out, "bleach_rates.csv"), index=False)
-
-    cells = per_cell(df, args, directions)
-    summary, tests = summarise(cells)
-    tc_long, tc_wide = timecourse_tables(df)
-
-    keep_cols = ["source", "row_id", "cell_id", "Image", "roi", "Slice", "time", "reporter", "treatment",
-                 "dose_mM", "treat_time", "pyruvate", "replicate", "position", "Area", "Mean", "StdDev", "Min",
-                 "Max", "Median", "IntDen", "bg_mean", "Mean_SN", "Median_SN", "pre_mean", "pre_median",
-                 "baseline_bgsub", "bright", "norm_mean", "norm_median", "norm_corr"]
-    df[[k for k in keep_cols if k in df]].to_csv(os.path.join(out, "timecourses_long.csv"), index=False)
-    tc_long.to_csv(os.path.join(out, "timecourse_mean_by_dose.csv"), index=False)
-    cells.to_csv(os.path.join(out, "rates_per_cell.csv"), index=False)
+    keep = ["source", "row_id", "cell_id", "Image", "roi", "Slice", "time", "reporter", "treatment", "replicate",
+            "position", "Area", "Mean", "StdDev", "Min", "Max", "Median", "IntDen", "bg_mean", "Mean_SN",
+            "Median_SN", "pre_mean", "pre_median", "baseline_bgsub", "bright", "norm_mean", "norm_median",
+            "norm_corr"]
+    tr[[k for k in keep if k in tr]].to_csv(os.path.join(out, "timecourses_long.csv"), index=False)
+    tc_long.to_csv(os.path.join(out, "timecourse_mean_by_treatment.csv"), index=False)
+    first = ["cell_id", "source", "replicate", "unit", "reporter", "direction", "treatment", "dose_mM", "image",
+             "position", "roi"]
+    cells[first + [c for c in cells if c not in first]].to_csv(os.path.join(out, "rates_per_cell.csv"), index=False)
     rep_cols = ["flux_pct_per_min", "slope_pct_per_min", "gain_at_t", "auc_frac_min"]
     fit_cols = ["k_per_min", "t_half_s", "amplitude"]
-    b_ = cells[cells.bright].groupby(["reporter", "dose_mM", "source", "replicate"])
-    f_ = cells[cells.good_fit].groupby(["reporter", "dose_mM", "source", "replicate"])
+    b_ = cells[cells.bright].groupby(["reporter", "treatment", "source", "replicate"])
+    f_ = cells[cells.good_fit].groupby(["reporter", "treatment", "source", "replicate"])
     pd.concat([b_.size().rename("n_bright"), b_[rep_cols].median(),
                f_.size().rename("n_good_fit"), f_[fit_cols].median().add_suffix("_goodfit")], axis=1
               ).reset_index().to_csv(os.path.join(out, "replicate_medians.csv"), index=False)
-    summary.to_csv(os.path.join(out, "summary_by_dose.csv"), index=False)
+    summary.to_csv(os.path.join(out, "summary_by_treatment.csv"), index=False)
     tests.to_csv(os.path.join(out, "statistics.csv"), index=False)
 
     for rep in reps:
@@ -806,66 +988,102 @@ def analyse(raw, out, args):
         tc_wide[rep].to_csv(os.path.join(out, f"timecourse_{rep}_wide.csv"), index=False)
         for err in TIMECOURSE_ERRORS:
             suffix = "" if err == "sem" else f"_{err}"
-            fig_timecourse(df, rep, d, args, os.path.join(out, f"timecourse_{rep}{suffix}.png"), err=err)
-        ref = cells[cells.bright & (cells.reporter == rep)]
-        ref = ref[ref.dose_mM == ref.dose_mM.min()].flux_pct_per_min.median()
-        fig_metric(cells, tests, rep, d, "flux_pct_per_min",
-                   f"{rep} ({d}): initial flux k × amplitude, all bright cells\n(control median {ref:.1f})",
+            fig_timecourse(tr, conds, rep, d, args, os.path.join(out, f"timecourse_{rep}{suffix}.png"), err=err)
+        ref = cells[cells.bright & (cells.reporter == rep) & (cells.treatment == control)].flux_pct_per_min.median()
+        fig_metric(cells, tests, conds, control, rep, d, "flux_pct_per_min",
+                   f"{rep} ({d}): initial flux k × amplitude, all bright cells\n({control} median {ref:.1f})",
                    "% of baseline per min", os.path.join(out, f"flux_{rep}.png"))
-        fig_metric(cells, tests, rep, d, "slope_pct_per_min",
+        fig_metric(cells, tests, conds, control, rep, d, "slope_pct_per_min",
                    f"{rep} ({d}): model-free initial slope, all bright cells\n(linear fit, frames "
                    f"{ACTIVATION_FRAME}–{ACTIVATION_FRAME + SLOPE_FRAMES})", "% of baseline per min",
                    os.path.join(out, f"slope_{rep}.png"))
-        fig_metric(cells, tests, rep, d, "t_half_s",
+        fig_metric(cells, tests, conds, control, rep, d, "t_half_s",
                    f"{rep} ({d}): half-time of fitted exponential, well-fit cells", "t½ (s)",
                    os.path.join(out, f"half_time_{rep}.png"), goodfit=True, fmt="{:.0f}", clip=(0, 600),
                    zero_line=False)
-        fig_metric(cells, tests, rep, d, "k_per_min",
+        fig_metric(cells, tests, conds, control, rep, d, "k_per_min",
                    f"{rep} ({d}): rate constant k of fitted exponential, well-fit cells", "k (per min)",
                    os.path.join(out, f"k_{rep}.png"), goodfit=True, fmt="{:.2f}", zero_line=False)
-        fig_pct_goodfit(cells, tests, rep, d, args, os.path.join(out, f"pct_well_fit_{rep}.png"))
-        fig_logfits(df, cells, rep, d, args, os.path.join(out, f"log_fits_{rep}.png"))
-    fig_bleach(bleach, cells, reps, directions, args, os.path.join(out, "bleach_correction.png"))
+        fig_pct_goodfit(cells, tests, conds, control, rep, d, args, os.path.join(out, f"pct_well_fit_{rep}.png"))
+        fig_logfits(tr, cells, conds, rep, d, args, os.path.join(out, f"log_fits_{rep}.png"))
+    fig_bleach(bleach_tab, cells, conds, control, reps, directions, args, os.path.join(out, "bleach_correction.png"))
     for m in RATE_SCATTER_METRICS:
-        fig_rate_scatter(cells, directions, m, os.path.join(out, f"export_vs_import_{RATE_NAMES[m][2]}.png"))
-
-    if SAVE_CELL_PLOTS:
-        n = cell_plots(df, cells, args, os.path.join(out, "cell_plots"))
-        print(f"Saved {n} per-cell plots")
+        fig_rate_scatter(cells, conds, directions, m, os.path.join(out, f"export_vs_import_{RATE_NAMES[m][2]}.png"))
 
     pd.set_option("display.width", 200)
-    print("Bleaching (%/min):", {f"{src} {r}": round(v["b"] * 6000, 3) for (src, r), v in bleach.items()})
-    print(summary[["reporter", "direction", "dose_mM", "n_bright", "pct_responders", "flux_median",
+    print(summary[["reporter", "direction", "treatment", "n_bright", "pct_responders", "flux_median",
                    "flux_pct_of_control", "slope_median", "t_half_s_goodfit"]].round(2).to_string(index=False))
+
+
+def analyse(raw, meta, out, args):
+    """raw: measurements (None when REASSIGN_ONLY); meta: treatment table(s) with a source column."""
+    os.makedirs(out, exist_ok=True)
+    if raw is None:
+        fits, traces, bleach_tab = load_cache(out)
+        print(f"Reusing saved fits ({fits.cell_key.nunique()} cells); re-reading treatments only")
+    else:
+        fits, traces, bleach_tab = fit_stage(raw, out, args)
+    directions = dict(zip(fits.reporter, fits.direction))
+    print("Bleaching (%/min):", {f"{r.source} {r.reporter}": round(r.b_pct_per_min_applied, 3)
+                                 for r in bleach_tab.itertuples()})
+
+    cells, tr = assign(fits, traces, meta)
+    names = list(cells.treatment.unique())
+    for set_name, spec in PLOT_SETS.items():
+        conds = select(names, spec)
+        if not conds:
+            print(f"Plot set '{set_name}': no matching treatments, skipped")
+            continue
+        control = CONTROLS.get(set_name, conds[0])
+        if control not in conds:
+            print(f"Plot set '{set_name}': control '{control}' not found; using '{conds[0]}'")
+            control = conds[0]
+        set_out = out if len(PLOT_SETS) == 1 else os.path.join(out, safe_name(set_name))
+        print(f"--- plot set '{set_name}': {', '.join(conds)} (control: {control})")
+        report(cells, tr, bleach_tab, conds, control, directions, args, set_out)
+
+    if SAVE_CELL_PLOTS:
+        n = cell_plots(tr, cells, args, os.path.join(out, "cell_plots"))
+        print(f"Saved {n} per-cell plots")
     print(f"Outputs written to {os.path.abspath(out)}\n")
 
 
 def main():
     args = settings()
     if not BATCH_FOLDERS:
-        print(f"=== {DATA_FOLDER}")
-        analyse(load_folder(DATA_FOLDER), os.path.join(DATA_FOLDER, OUTPUT_SUBFOLDER), args)
-        return
+        jobs = [(DATA_FOLDER, DATA_FOLDER)]
+    else:
+        jobs = [(f, os.path.join(f, BATCH_DATA_SUBFOLDER)) for f in BATCH_FOLDERS]
     loaded = []
-    for folder in BATCH_FOLDERS:
+    for folder, data_folder in jobs:
         print(f"=== {folder}")
-        data_folder = os.path.join(folder, BATCH_DATA_SUBFOLDER)
+        out = os.path.join(data_folder, OUTPUT_SUBFOLDER)
         try:
-            raw = load_folder(folder, data_folder)
-            analyse(raw, os.path.join(data_folder, OUTPUT_SUBFOLDER), args)
-            loaded.append(raw)
+            if REASSIGN_ONLY:
+                source, _ = experiment(folder, data_folder)
+                raw, meta = None, load_meta(find_file(data_folder, META_FILE), source)
+            else:
+                raw, meta = load_folder(folder, data_folder)
+            analyse(raw, meta, out, args)
+            loaded.append((raw, meta))
         except Exception as e:
+            if not BATCH_FOLDERS:
+                raise
             print(f"Skipped {folder}: {e}\n")
-    if COMBINE_BATCH and len(loaded) > 1:
+    if BATCH_FOLDERS and COMBINE_BATCH and len(loaded) > 1:
         print("=== pooled")
-        pooled = []
-        for raw in loaded:      # keep image names unique across folders
-            raw = raw.copy()
-            raw["Image"] = raw["source"] + "/" + raw["Image"]
-            pooled.append(raw)
         out = POOLED_OUTPUT if os.path.isabs(POOLED_OUTPUT) else \
             os.path.join(os.path.dirname(os.path.abspath(__file__)), POOLED_OUTPUT)
-        analyse(pd.concat(pooled, ignore_index=True), out, args)
+        meta = pd.concat([m for _, m in loaded], ignore_index=True)
+        raw = None
+        if not REASSIGN_ONLY:
+            pooled = []
+            for r, _ in loaded:      # keep image names unique across folders
+                r = r.copy()
+                r["Image"] = r["source"] + "/" + r["Image"]
+                pooled.append(r)
+            raw = pd.concat(pooled, ignore_index=True)
+        analyse(raw, meta, out, args)
 
 
 if __name__ == "__main__":
