@@ -1,0 +1,29 @@
+# This repo is public: only scripts and docs go in analysis/.
+# Inputs, outputs and images stay in the project's shared folder.
+*.csv
+*.tsv
+*.txt
+*.xlsx
+*.tif
+*.tiff
+*.npy
+*.npz
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+*.zip
+
+# Script input and output folders
+inputs/
+nct_results/
+nct_results_pooled/
+atp_results/
+script_output/
+example_cell_plots/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
