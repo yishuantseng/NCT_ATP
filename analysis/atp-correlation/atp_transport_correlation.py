@@ -70,10 +70,26 @@ BATCH_RUNS = [
 # Folders are searched recursively for ATP_FILE_NAME and for <NCT_SUBFOLDER>/RATES_FILE.
 # Used when PAIRS_FILE is "" and BATCH_RUNS is empty; results go to OUTPUT_FOLDER/BULK_NAME.
 BULK_ATP = [
-    # "/path/to/ATP_experiments",            # e.g. folder holding 20260925_MN_92, 20260930_MN_92, ...
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250709_MN_glu_92",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250718_MN_glu_92",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250723_MN_glu_92",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250813_MN_glu_92",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2026/01-03/20260313_MN_glu_92",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/04-06/20260507_MN_92",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261002_MN_92",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261009_MN_92",
 ]
 BULK_NCT = [
-    # "/path/to/NCT_experiments",            # e.g. folder holding 20260925_MN_110,111/nct_results, ...
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250702_MN_glu_110,111/analysis",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250709_MN_glu_110,111/analysis",  # bad 111 control, see EXCLUDE_RATES
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250718_MN_glu_110,111/analysis",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250813_MN_glu_110,111/analysis",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260220_MN_glu_110,111/analysis",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260227_MN_glu_110,111/analysis",
+    "/Volumes/Holtlab_YST/Yi-Shuan/microscope/2026/01-03/20260318_MN_glu_110,111/analysis",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260325_MN_glu_110,111,185/analysis",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260327_MN_glu_110,111,185/analysis",
+    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111/analysis",
 ]
 BULK_NAME = "bulk"
 
@@ -81,7 +97,8 @@ BULK_NAME = "bulk"
 # Each rule drops rows from files whose path contains "path_contains" and whose other columns all
 # match (treatment compared ignoring case and spaces). Leave out a column to match any value.
 EXCLUDE_RATES = [
-    # {"path_contains": "20250709_MN_glu_110,111", "reporter": 111, "treatment": "control"},
+    # bad 111 control on 20250709: set "treatment" to that control's exact treatment name
+    {"path_contains": "20250709_MN_glu_110,111", "reporter": 111, "treatment": "control"},
 ]
 EXCLUDE_ATP = [
     # {"path_contains": "20250709_MN_glu_92", "treatment": "control"},
@@ -121,7 +138,7 @@ ABSOLUTE_EXPORT = True                        # plot/correlate |rate| for export
 
 # --- Matching ----------------------------------------------------------------
 MATCH_MODE = "condition"                      # "condition" (by treatment group) or "cell"
-GROUP_BY = "dose"                             # "dose": the number before "mM" in the treatment text (dose series)
+GROUP_BY = "treatment"                        # "dose": the number before "mM" in the treatment text (dose series)
                                               # "treatment": the full treatment label, for any mix of treatments
 TREATMENT_COLUMNS = ["treatment"]             # "treatment" mode: columns that make up the label, present in both
                                               # files; e.g. add "treat_time", "pyruvate" to keep those apart
@@ -323,6 +340,9 @@ def read_excluding(path, rules, label):
                    (df[col].astype(str) == str(val))
         if hit.any():
             print(f"{label}: excluded {hit.sum()} rows matching {rule} from {path}")
+        else:
+            print(f"{label}: WARNING exclude rule {rule} matched no rows in {path}"
+                  + (f" (treatments: {sorted(df['treatment'].astype(str).unique())})" if "treatment" in df else ""))
         df = df[~hit]
     return df
 
