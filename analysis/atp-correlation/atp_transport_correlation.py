@@ -77,6 +77,16 @@ BULK_NCT = [
 ]
 BULK_NAME = "bulk"
 
+# --- Excluding bad data (any mode) -------------------------------------------
+# Each rule drops rows from files whose path contains "path_contains" and whose other columns all
+# match (treatment compared ignoring case and spaces). Leave out a column to match any value.
+EXCLUDE_RATES = [
+    # {"path_contains": "20250709_MN_glu_110,111", "reporter": 111, "treatment": "control"},
+]
+EXCLUDE_ATP = [
+    # {"path_contains": "20250709_MN_glu_92", "treatment": "control"},
+]
+
 ATP_FILE_NAME = "all_images_measurements.csv"  # file looked for when an ATP path is a folder
 RATES_FILE = "rates_per_cell.csv"             # file looked for inside each NCT results folder
 OUTPUT_FOLDER = "atp_results"                 # batch: one subfolder per pair
@@ -287,11 +297,29 @@ def read_pairs():
     return runs
 
 
+def read_excluding(path, rules, label):
+    df = pd.read_csv(path)
+    for rule in rules:
+        rule = dict(rule)
+        if rule.pop("path_contains", "") not in path:
+            continue
+        hit = pd.Series(True, index=df.index)
+        for col, val in rule.items():
+            if col not in df:
+                raise SystemExit(f"Exclude rule {rule}: column '{col}' not in {path}")
+            hit &= (df[col].map(norm_key) == norm_key(val)) if col == "treatment" else \
+                   (df[col].astype(str) == str(val))
+        if hit.any():
+            print(f"{label}: excluded {hit.sum()} rows matching {rule} from {path}")
+        df = df[~hit]
+    return df
+
+
 def load_atp(atp_paths):
     files = [resolve_atp(p) for p in as_list(atp_paths)]
     for f in files:
         print(f"ATP file: {f}")
-    atp = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    atp = pd.concat([read_excluding(f, EXCLUDE_ATP, "ATP") for f in files], ignore_index=True)
     n0 = len(atp)
     for col, val in ATP_FILTERS.items():
         atp = atp[atp[col] == val]
@@ -307,7 +335,7 @@ def load_rates(folders):
     files = [resolve_rates(f) for f in as_list(folders)]
     for f in files:
         print(f"Rates file: {f}")
-    rates = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    rates = pd.concat([read_excluding(f, EXCLUDE_RATES, "Rates") for f in files], ignore_index=True)
     if RATES_BRIGHT_ONLY:
         rates = rates[rates["bright"].astype(str) == "True"]
     rates = add_condition(rates.copy(), "treatment", "Rates")

@@ -25,6 +25,12 @@ Set `BULK_ATP` and `BULK_NCT` to one or more folders. The script searches them r
 `nct_results_pooled/` are skipped so their cells aren't counted twice). It then pools all the cells and
 compares ATP/ADP with the transport rates by dose. The results go to `atp_results/bulk/`.
 
+## Excluding bad data
+
+`EXCLUDE_RATES` and `EXCLUDE_ATP` drop rows from specific files. For example,
+`{"path_contains": "20250709_MN_glu_110,111", "reporter": 111, "treatment": "control"}` drops the 111
+control cells from that experiment only. Leave out a column to match any value.
+
 ## Batch runs (NCT and ATP in different folders)
 
 Each experiment needs its NCT results and its ATP file paired. There are two ways to do it:
