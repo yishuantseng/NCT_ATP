@@ -97,8 +97,8 @@ BULK_NAME = "bulk"
 # Each rule drops rows from files whose path contains "path_contains" and whose other columns all
 # match (treatment compared ignoring case and spaces). Leave out a column to match any value.
 EXCLUDE_RATES = [
-    # bad 111 control on 20250709: set "treatment" to that control's exact treatment name
-    {"path_contains": "20250709_MN_glu_110,111", "reporter": 111, "treatment": "control"},
+    # bad 111 control on 20250709 (control = 2.5mM gluc in this batch; "glu" also matches)
+    {"path_contains": "20250709_MN_glu_110,111", "reporter": 111, "treatment": "2.5mM gluc"},
 ]
 EXCLUDE_ATP = [
     # {"path_contains": "20250709_MN_glu_92", "treatment": "control"},
