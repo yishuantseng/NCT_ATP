@@ -93,6 +93,7 @@ TREATMENT_ORDER = []
 # A set without an entry uses its first treatment.
 CONTROLS = {
     # "gluc": "2.5mM gluc",
+    "2DG": "0mM 2DG"
 }
 
 # --- Imaging -----------------------------------------------------------------
