@@ -98,7 +98,7 @@ CONTROLS = {
 
 # --- Imaging -----------------------------------------------------------------
 INTERVAL_S = 30.0            # seconds between frames
-INTENSITY = "mean"           # ROI statistic used for the traces and fits: "mean" or "median"
+INTENSITY = "median"         # ROI statistic used for the traces and fits: "mean" or "median"
                              # ("bright" always uses the mean baseline; changing this needs a full run)
 ACTIVATION_FRAME = 4         # last pre-activation frame (1-based); activation time t0 = (frame-1)*interval
 DIRECTIONS = {110: "import", 111: "export"}   # reporters not listed are guessed from the data
