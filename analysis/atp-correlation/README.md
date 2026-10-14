@@ -16,7 +16,9 @@ By default (`GROUP_BY = "dose"`), ATP and NCT data are matched by the mM number 
 which suits a 2DG dose series. For any other mix of treatments (controls, other drugs, µM doses), set
 `GROUP_BY = "treatment"`. Conditions are then matched by their full treatment label, ignoring case and
 spaces. Add `"treat_time"` or `"pyruvate"` to `TREATMENT_COLUMNS` to keep those apart, and use
-`CONDITION_ORDER` to set the plot order.
+`CONDITION_ORDER` to set the plot order. `TREATMENT_ALIASES` renames whole words before matching, so with the default
+`{"glu": "gluc"}` "25mM glu" and "25mM gluc" count as the same condition ("glucose" is left alone).
+`IGNORE_REPORTERS` (default `[185]`) leaves reporters out of the analysis.
 
 ## Bulk run (no pairing)
 

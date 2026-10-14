@@ -106,6 +106,7 @@ ATP_AREA_COLUMN = "cell_area_px"
 
 # --- Transport rates ---------------------------------------------------------
 RATES_BRIGHT_ONLY = True                      # use only "bright" cells (as in nct_analysis summaries)
+IGNORE_REPORTERS = [185]                      # reporters left out of the analysis
 # metric column -> (label, use well-fit cells only)
 RATE_METRICS = {
     "flux_pct_per_min": ("Initial flux (% baseline/min)", False),
@@ -124,6 +125,9 @@ GROUP_BY = "dose"                             # "dose": the number before "mM" i
                                               # "treatment": the full treatment label, for any mix of treatments
 TREATMENT_COLUMNS = ["treatment"]             # "treatment" mode: columns that make up the label, present in both
                                               # files; e.g. add "treat_time", "pyruvate" to keep those apart
+TREATMENT_ALIASES = {                         # whole words renamed in treatment text before matching (any case),
+    "glu": "gluc",                            # so "5mM glu" and "5mM gluc" are the same condition
+}
 CONDITION_ORDER = []                          # "treatment" mode: optional plot order of labels; [] = by dose, then name
 ATP_CELL_KEY = "cell_id"                      # cell mode only: column in ATP_FILE ...
 RATES_CELL_KEY = "cell_id"                    # ... and in rates_per_cell.csv with the same values
@@ -211,8 +215,16 @@ def dose_from_treatment(s):
     return float(m.group(1)) if m else np.nan
 
 
+def apply_aliases(text):
+    """Rename whole words (not parts of longer words; "25mMglu" counts) per TREATMENT_ALIASES, ignoring case."""
+    text = str(text).strip()
+    for old, new in TREATMENT_ALIASES.items():
+        text = re.sub(rf"(?:(?<![A-Za-z])|(?<=[munµ]M)){re.escape(old)}(?![A-Za-z])", new, text, flags=re.IGNORECASE)
+    return text
+
+
 def norm_key(text):
-    return re.sub(r"\s+", "", str(text)).lower()
+    return re.sub(r"\s+", "", apply_aliases(text)).lower()
 
 
 def add_condition(df, treatment_col, source):
@@ -230,7 +242,7 @@ def add_condition(df, treatment_col, source):
     missing = [c for c in cols if c not in df]
     if missing:
         raise SystemExit(f"{source}: column(s) {missing} not found (TREATMENT_COLUMNS)")
-    df["condition"] = df[cols].astype(str).apply(lambda r: " | ".join(v.strip() for v in r), axis=1)
+    df["condition"] = df[cols].astype(str).apply(lambda r: " | ".join(apply_aliases(v) for v in r), axis=1)
     df["cond_key"] = df["condition"].map(norm_key)
     return df
 
@@ -336,6 +348,10 @@ def load_rates(folders):
     for f in files:
         print(f"Rates file: {f}")
     rates = pd.concat([read_excluding(f, EXCLUDE_RATES, "Rates") for f in files], ignore_index=True)
+    ignored = rates["reporter"].isin(IGNORE_REPORTERS)
+    if ignored.any():
+        print(f"Rates: ignored {ignored.sum()} cells of reporter(s) {sorted(rates.loc[ignored, 'reporter'].astype(str).unique())}")
+    rates = rates[~ignored]
     if RATES_BRIGHT_ONLY:
         rates = rates[rates["bright"].astype(str) == "True"]
     rates = add_condition(rates.copy(), "treatment", "Rates")
