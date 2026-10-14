@@ -70,6 +70,10 @@ POOLED_OUTPUT = "nct_results_pooled"
 REASSIGN_ONLY = False
 
 # --- Treatments and plot sets --------------------------------------------------
+# Text replacements applied to the treatment column when it is read (regular expressions, case-insensitive).
+# The default turns "glu" (not followed by a letter) into "gluc": "2.5mM glu" -> "2.5mM gluc";
+# "gluc", "glucose" and "glutamine" are left alone.
+TREATMENT_REPLACE = {r"glu(?![a-z])": "gluc"}
 # Cells are grouped by the full text of the `treatment` column.
 # Plot sets: each set gets its own summaries, statistics and plots (in a subfolder named after the set
 # when there is more than one set). A set is
@@ -95,6 +99,7 @@ CONTROLS = {
 INTERVAL_S = 30.0            # seconds between frames
 ACTIVATION_FRAME = 4         # last pre-activation frame (1-based); activation time t0 = (frame-1)*interval
 DIRECTIONS = {110: "import", 111: "export"}   # reporters not listed are guessed from the data
+EXCLUDE_REPORTERS = [185]    # reporters left out of fitting, statistics and plots
 
 # --- Cell selection ----------------------------------------------------------
 MIN_AREA_PX = 1000           # minimum ROI area in every frame
@@ -213,6 +218,8 @@ def load_meta(path, source):
     meta = pd.read_csv(path).rename(columns={"image": "image_base", "time": "treat_time"})
     meta["image_base"] = meta["image_base"].astype(str).str.strip()
     meta["treatment"] = meta["treatment"].astype(str).str.strip()
+    for pattern, new in TREATMENT_REPLACE.items():
+        meta["treatment"] = meta["treatment"].str.replace(pattern, new, case=False, regex=True)
     if "replicate" not in meta:
         meta["replicate"] = "A"
     meta["replicate"] = meta["replicate"].fillna("A").astype(str).str.strip()
@@ -247,6 +254,10 @@ def load_measurements(results_path, bg_path, meta):
         print(f"  Note: {len(missing)} image(s) are not in the meta file and were left out, e.g. {missing[0]}")
         res = res[res.reporter.notna()]
     res["reporter"] = res["reporter"].astype(int)
+    excluded = res.reporter.isin(EXCLUDE_REPORTERS)
+    if excluded.any():
+        print(f"  Reporter(s) {sorted(int(r) for r in res[excluded].reporter.unique())} left out (EXCLUDE_REPORTERS)")
+        res = res[~excluded]
 
     bg = pd.read_csv(bg_path)
     bg["Image"] = bg["Label"].str.replace(r"_\d+\.tif$", "", regex=True)
@@ -511,10 +522,12 @@ def assign(fits, traces, meta):
               f"e.g. {unassigned[0]}")
     m = m.drop(columns="reporter")
     cells = fits.merge(m, on=["source", "image_base"], how="inner")
+    cells = cells[~cells.reporter.isin(EXCLUDE_REPORTERS)]
     cells["cell_id"] = cells.cell_key + " | " + cells.treatment
     cells["unit"] = cells.source + "_" + cells.replicate
     cells["dose_mM"] = cells.treatment.str.extract(r"([\d.]+)\s*mM")[0].astype(float)
     tr = traces.merge(m[["source", "image_base", "treatment", "replicate"]], on=["source", "image_base"], how="inner")
+    tr = tr[~tr.reporter.isin(EXCLUDE_REPORTERS)]
     tr["cell_id"] = tr.cell_key + " | " + tr.treatment
     n_multi = cells.groupby("cell_key").treatment.nunique().gt(1).sum()
     if n_multi:
@@ -1054,7 +1067,7 @@ def cell_plots(traces, cells, args, outdir):
         verdict = ("well-fit" if r.good_fit else "dim" if not r.bright else
                    "non-responder" if not r.responder else "k at bound" if r.k_at_bound else "low R²")
         treat = ", ".join(cells[cells.cell_key == key].treatment)
-        ax.set_title(f"{os.path.basename(r.image)} ROI {r.roi}  ({r.reporter}; {treat})\n"
+        ax.set_title(f"{os.path.basename(r.image)} ROI {r.roi}  ({r.reporter}; {treat})\n" +
                      (f"flux {r.flux_pct_per_min / 100:.3f} min⁻¹" if RATE_UNIT == "per_min" else f"flux {r.flux_pct_per_min:.1f} %/min") + f" · amp {r.amplitude:.2f} · "
                      f"t½ {r.t_half_s:.0f} s · R² {r.r2:.2f} · {verdict}", loc="left", fontsize=8)
         ax.set_xlabel("time (s)")
