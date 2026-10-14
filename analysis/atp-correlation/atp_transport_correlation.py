@@ -16,8 +16,11 @@ INPUT FILES (single run: ATP_FILE + RATES_FOLDER; batch: PAIRS_FILE or BATCH_RUN
 
 HOW THEY ARE MATCHED
   MATCH_MODE = "condition" (default)
-    ATP and transport were measured in different cells and dishes, so they are paired by condition
-    (2DG dose). For each dose: median ATP/ADP and median rate, with bootstrap 95% CIs over cells.
+    ATP and transport were measured in different cells and dishes, so they are paired by condition:
+    GROUP_BY = "dose" uses the mM number in the treatment text (a 2DG dose series; treatments without
+    one are dropped); GROUP_BY = "treatment" uses the full treatment label (built from
+    TREATMENT_COLUMNS, matched ignoring case and spaces), so any mix of treatments works as long as
+    both files name them the same way. Below, "dose" means either. For each dose: median ATP/ADP and median rate, with bootstrap 95% CIs over cells.
     Across doses: Pearson r, Spearman rho and a linear fit of rate vs ATP/ADP.
     p-values are exact permutation tests over the doses. Only doses present in both files are used;
     with 4 shared doses the smallest possible two-sided p is 2/24 = 0.083, with 5 it is 2/120 = 0.017. r_CI is a bootstrap CI that resamples cells within each
@@ -27,6 +30,7 @@ HOW THEY ARE MATCHED
     and correlated per cell (per reporter, and per dose if PER_DOSE_CELL_STATS).
 
 OUTPUTS (in OUTPUT_FOLDER, or OUTPUT_FOLDER/<batch name> for each pair in batch mode)
+  (file names say "treatment" instead of "dose" when GROUP_BY = "treatment")
   atp_by_dose.csv          ATP/ADP per dose: n cells, n images, median, 95% CI, mean, SEM
   rates_vs_atp_by_dose.csv One row per reporter x dose: ATP/ADP and every rate metric (median, CI)
   correlations.csv         One row per reporter x rate metric: r, rho, permutation p, slope, r CI
@@ -105,7 +109,12 @@ MAIN_METRIC = "flux_pct_per_min"              # metric shown in rate_vs_atp.png
 ABSOLUTE_EXPORT = True                        # plot/correlate |rate| for export (export flux is negative)
 
 # --- Matching ----------------------------------------------------------------
-MATCH_MODE = "condition"                      # "condition" (by 2DG dose) or "cell"
+MATCH_MODE = "condition"                      # "condition" (by treatment group) or "cell"
+GROUP_BY = "dose"                             # "dose": the number before "mM" in the treatment text (dose series)
+                                              # "treatment": the full treatment label, for any mix of treatments
+TREATMENT_COLUMNS = ["treatment"]             # "treatment" mode: columns that make up the label, present in both
+                                              # files; e.g. add "treat_time", "pyruvate" to keep those apart
+CONDITION_ORDER = []                          # "treatment" mode: optional plot order of labels; [] = by dose, then name
 ATP_CELL_KEY = "cell_id"                      # cell mode only: column in ATP_FILE ...
 RATES_CELL_KEY = "cell_id"                    # ... and in rates_per_cell.csv with the same values
 PER_DOSE_CELL_STATS = True                    # cell mode: also correlate within each dose
@@ -138,6 +147,7 @@ warnings.filterwarnings("ignore")
 
 DOSE_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
 REPORTER_COLORS = {"import": "#2a78d6", "export": "#c2410c"}
+TREATMENT_COLORS = ["#2a78d6", "#c2410c", "#16a34a", "#9333ea", "#d97706", "#0891b2", "#db2777", "#4b5563"]
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -189,6 +199,40 @@ def boot_median(v, rng):
 def dose_from_treatment(s):
     m = re.search(r"([\d.]+)\s*mM", str(s))
     return float(m.group(1)) if m else np.nan
+
+
+def norm_key(text):
+    return re.sub(r"\s+", "", str(text)).lower()
+
+
+def add_condition(df, treatment_col, source):
+    """Add cond_key (what is matched), condition (display label) and dose_mM."""
+    df["dose_mM"] = df[treatment_col].map(dose_from_treatment)
+    if GROUP_BY == "dose":
+        df["cond_key"] = df["dose_mM"]
+        df["condition"] = df["dose_mM"].map(lambda d: f"{d:g} mM")
+        dropped = df["dose_mM"].isna()
+        if dropped.any():
+            print(f"{source}: {dropped.sum()} cells without an mM dose dropped "
+                  f"({sorted(df.loc[dropped, treatment_col].astype(str).unique())}); use GROUP_BY = 'treatment'")
+        return df[~dropped].copy()
+    cols = [treatment_col if c == "treatment" else c for c in TREATMENT_COLUMNS]
+    missing = [c for c in cols if c not in df]
+    if missing:
+        raise SystemExit(f"{source}: column(s) {missing} not found (TREATMENT_COLUMNS)")
+    df["condition"] = df[cols].astype(str).apply(lambda r: " | ".join(v.strip() for v in r), axis=1)
+    df["cond_key"] = df["condition"].map(norm_key)
+    return df
+
+
+def condition_order(keys, labels, doses):
+    """Sort condition keys: CONDITION_ORDER first, then by dose, then by label."""
+    wanted = [norm_key(c) for c in CONDITION_ORDER]
+    def sort_key(k):
+        d = doses.get(k, np.nan)
+        return (wanted.index(k) if k in wanted else len(wanted),
+                d if np.isfinite(d) else np.inf, str(labels.get(k, k)))
+    return sorted(keys, key=sort_key)
 
 
 # --------------------------------------------------------------------------- loading
@@ -254,7 +298,7 @@ def load_atp(atp_paths):
     if ATP_AREA_COLUMN in atp:
         atp = atp[atp[ATP_AREA_COLUMN].between(ATP_MIN_AREA_PX, ATP_MAX_AREA_PX)]
     atp = atp[np.isfinite(atp[ATP_COLUMN]) & (atp[ATP_COLUMN] > 0)].copy()
-    atp["dose_mM"] = atp[ATP_TREATMENT_COLUMN].map(dose_from_treatment)
+    atp = add_condition(atp, ATP_TREATMENT_COLUMN, "ATP")
     print(f"ATP: kept {len(atp)} of {n0} cells after filters")
     return atp
 
@@ -266,7 +310,7 @@ def load_rates(folders):
     rates = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     if RATES_BRIGHT_ONLY:
         rates = rates[rates["bright"].astype(str) == "True"]
-    rates = rates.copy()
+    rates = add_condition(rates.copy(), "treatment", "Rates")
     if ABSOLUTE_EXPORT:
         exp = rates["direction"] == "export"
         for m in ("flux_pct_per_min", "slope_pct_per_min", "gain_at_t", "auc_frac_min"):
@@ -285,39 +329,50 @@ def metric_values(df, metric):
 # --------------------------------------------------------------------------- condition mode
 def atp_by_dose(atp, rng):
     rows, boots = [], {}
-    for dose, g in atp.groupby("dose_mM"):
+    for key, g in atp.groupby("cond_key"):
         med, lo, hi, meds = boot_median(g[ATP_COLUMN], rng)
-        boots[dose] = meds
+        boots[key] = meds
         v = g[ATP_COLUMN]
-        rows.append(dict(dose_mM=dose, n_cells=len(g), n_images=g[ATP_IMAGE_COLUMN].nunique(),
+        rows.append(dict(cond_key=key, condition=g["condition"].iloc[0], dose_mM=g["dose_mM"].iloc[0],
+                         n_cells=len(g), n_images=g[ATP_IMAGE_COLUMN].nunique(),
                          atp_median=med, atp_ci_low=lo, atp_ci_high=hi,
                          atp_mean=v.mean(), atp_sem=v.sem()))
-    return pd.DataFrame(rows), boots
+    tab = pd.DataFrame(rows)
+    order = condition_order(tab["cond_key"], dict(zip(tab.cond_key, tab.condition)),
+                            dict(zip(tab.cond_key, tab.dose_mM)))
+    tab = tab.set_index("cond_key").loc[order].reset_index()
+    tab["order"] = range(len(tab))
+    return tab, boots
 
 
 def condition_mode(atp, rates, out, rng):
     atp_tab, atp_boot = atp_by_dose(atp, rng)
-    atp_tab.to_csv(os.path.join(out, "atp_by_dose.csv"), index=False)
+    suffix = "dose" if GROUP_BY == "dose" else "treatment"
+    atp_tab.drop(columns="cond_key").to_csv(os.path.join(out, f"atp_by_{suffix}.csv"), index=False)
+    missing = sorted(set(rates.loc[~rates["cond_key"].isin(atp_tab["cond_key"]), "condition"]))
+    if missing:
+        print(f"No ATP data for: {missing}")
 
     rows, corr_rows = [], []
     for (rep, direction), rg in rates.groupby(["reporter", "direction"]):
-        doses = sorted(set(rg["dose_mM"]) & set(atp_tab["dose_mM"]))
+        doses = [k for k in atp_tab["cond_key"] if k in set(rg["cond_key"])]
         for metric in RATE_METRICS:
             if metric not in rg:
                 continue
             med, rboot = [], []
             for d in doses:
-                m, lo, hi, meds = boot_median(metric_values(rg[rg["dose_mM"] == d], metric), rng)
+                m, lo, hi, meds = boot_median(metric_values(rg[rg["cond_key"] == d], metric), rng)
                 med.append(m)
                 rboot.append(meds)
-                a = atp_tab.set_index("dose_mM").loc[d]
-                rows.append(dict(reporter=rep, direction=direction, metric=metric, dose_mM=d,
+                a = atp_tab.set_index("cond_key").loc[d]
+                rows.append(dict(reporter=rep, direction=direction, metric=metric,
+                                 condition=a.condition, dose_mM=a.dose_mM, order=a.order,
                                  atp_median=a.atp_median, atp_ci_low=a.atp_ci_low,
                                  atp_ci_high=a.atp_ci_high, n_atp_cells=a.n_cells,
                                  rate_median=m, rate_ci_low=lo, rate_ci_high=hi,
                                  n_rate_cells=int(np.isfinite(metric_values(
-                                     rg[rg["dose_mM"] == d], metric)).sum())))
-            x = atp_tab.set_index("dose_mM").loc[doses, "atp_median"].to_numpy()
+                                     rg[rg["cond_key"] == d], metric)).sum())))
+            x = atp_tab.set_index("cond_key").loc[doses, "atp_median"].to_numpy()
             y = np.array(med)
             ok = np.isfinite(x) & np.isfinite(y)
             x, y = x[ok], y[ok]
@@ -333,7 +388,7 @@ def condition_mode(atp, rates, out, rng):
             else:
                 r_lo = r_hi = np.nan
             corr_rows.append(dict(reporter=rep, direction=direction, metric=metric,
-                                  n_doses=len(x), pearson_r=pearson(x, y),
+                                  n_conditions=len(x), pearson_r=pearson(x, y),
                                   pearson_perm_p=perm_p(x, y, pearson),
                                   pearson_r_boot_ci_low=r_lo, pearson_r_boot_ci_high=r_hi,
                                   spearman_rho=spearman(x, y),
@@ -341,10 +396,10 @@ def condition_mode(atp, rates, out, rng):
                                   slope_rate_per_atp=slope, intercept=icpt))
     tab = pd.DataFrame(rows)
     corr = pd.DataFrame(corr_rows)
-    tab.to_csv(os.path.join(out, "rates_vs_atp_by_dose.csv"), index=False)
+    tab.drop(columns="order").to_csv(os.path.join(out, f"rates_vs_atp_by_{suffix}.csv"), index=False)
     corr.to_csv(os.path.join(out, "correlations.csv"), index=False)
 
-    plot_atp(atp, atp_tab, out)
+    plot_atp(atp, atp_tab, os.path.join(out, f"atp_by_{suffix}.png"))
     plot_rate_vs_atp(tab, corr, [MAIN_METRIC], os.path.join(out, "rate_vs_atp.png"))
     plot_rate_vs_atp(tab, corr, list(RATE_METRICS), os.path.join(out, "rate_vs_atp_all_metrics.png"))
     print(corr[corr["metric"] == MAIN_METRIC][["direction", "pearson_r", "pearson_perm_p",
@@ -360,17 +415,19 @@ def cell_mode(atp, rates, out):
                          "Use MATCH_MODE = 'condition' when ATP and transport are different cells.")
     m.to_csv(os.path.join(out, "cell_matched.csv"), index=False)
     rows = []
-    groups = [("all", None)] + ([(d, d) for d in sorted(m["dose_mM"].unique())] if PER_DOSE_CELL_STATS else [])
+    labels = dict(zip(m.cond_key, m.condition))
+    keys = condition_order(m["cond_key"].unique(), labels, dict(zip(m.cond_key, m.dose_mM)))
+    groups = [("all", None)] + ([(labels[k], k) for k in keys] if PER_DOSE_CELL_STATS else [])
     for (rep, direction), rg in m.groupby(["reporter", "direction"]):
         for metric in RATE_METRICS:
             for name, d in groups:
-                g = rg if d is None else rg[rg["dose_mM"] == d]
+                g = rg if d is None else rg[rg["cond_key"] == d]
                 _, goodfit_only = RATE_METRICS[metric]
                 if goodfit_only:
                     g = g[g["good_fit"].astype(str) == "True"]
                 g = g[np.isfinite(g[metric]) & np.isfinite(g[ATP_COLUMN])]
                 x, y = g[ATP_COLUMN].to_numpy(), g[metric].to_numpy()
-                rows.append(dict(reporter=rep, direction=direction, metric=metric, dose_mM=name,
+                rows.append(dict(reporter=rep, direction=direction, metric=metric, condition=name,
                                  n_cells=len(g), pearson_r=pearson(x, y),
                                  pearson_perm_p=perm_p(x, y, pearson),
                                  spearman_rho=spearman(x, y),
@@ -378,44 +435,54 @@ def cell_mode(atp, rates, out):
     pd.DataFrame(rows).to_csv(os.path.join(out, "cell_correlations.csv"), index=False)
 
     fig, axes = plt.subplots(1, m["direction"].nunique(), figsize=(5 * m["direction"].nunique(), 4), squeeze=False)
-    doses = sorted(m["dose_mM"].unique())
     for ax, (direction, g) in zip(axes[0], m.groupby("direction")):
-        for i, d in enumerate(doses):
-            gd = g[g["dose_mM"] == d]
+        for i, k in enumerate(keys):
+            gd = g[g["cond_key"] == k]
             ax.scatter(gd[ATP_COLUMN], gd[MAIN_METRIC], s=10, alpha=0.7,
-                       color=DOSE_COLORS[i % len(DOSE_COLORS)], label=f"{d:g} mM")
+                       color=cond_color(i, len(keys)), label=labels[k])
         ax.set_xlabel(ATP_LABEL)
         ax.set_ylabel(RATE_METRICS[MAIN_METRIC][0])
         ax.set_title(direction)
-        ax.legend(frameon=False, fontsize=8, title="2DG")
+        ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(os.path.join(out, "rate_vs_atp_cells.png"), dpi=FIG_DPI)
     plt.close(fig)
 
 
 # --------------------------------------------------------------------------- figures
+def cond_color(i, n):
+    """Blue ramp for a dose series; distinct categorical colours for mixed treatments."""
+    if GROUP_BY == "dose":
+        return DOSE_COLORS[min(int(i * len(DOSE_COLORS) / max(n, 1)), len(DOSE_COLORS) - 1)]
+    return TREATMENT_COLORS[i % len(TREATMENT_COLORS)]
+
+
 def style(ax):
     ax.spines[["top", "right"]].set_visible(False)
 
 
-def plot_atp(atp, atp_tab, out):
-    fig, ax = plt.subplots(figsize=(4.5, 4))
+def plot_atp(atp, atp_tab, path):
+    n = len(atp_tab)
+    fig, ax = plt.subplots(figsize=(max(4.5, 0.9 * n + 1.5), 4))
     rng = np.random.default_rng(RANDOM_SEED)
     for i, r in atp_tab.reset_index(drop=True).iterrows():
-        v = atp.loc[atp["dose_mM"] == r.dose_mM, ATP_COLUMN]
+        v = atp.loc[atp["cond_key"] == r.cond_key, ATP_COLUMN]
         ax.scatter(i + rng.uniform(-0.2, 0.2, len(v)), v, s=6, alpha=0.35,
-                   color=DOSE_COLORS[i % len(DOSE_COLORS)], linewidths=0)
+                   color=cond_color(i, n), linewidths=0)
         ax.errorbar(i, r.atp_median, yerr=[[r.atp_median - r.atp_ci_low], [r.atp_ci_high - r.atp_median]],
                     fmt="o", color="black", ms=5, capsize=4, zorder=3)
         ax.text(i, v.max(), f"n={int(r.n_cells)}", ha="center",
                 va="bottom", fontsize=7, color="0.4")
-    ax.set_xticks(range(len(atp_tab)), [f"{d:g}" for d in atp_tab["dose_mM"]])
-    ax.set_xlabel("2DG (mM)")
+    if GROUP_BY == "dose":
+        ax.set_xticks(range(n), [f"{d:g}" for d in atp_tab["dose_mM"]])
+        ax.set_xlabel("Dose (mM)")
+    else:
+        ax.set_xticks(range(n), atp_tab["condition"], rotation=30, ha="right", fontsize=8)
     ax.set_ylabel(ATP_LABEL)
-    ax.set_title("ATP/ADP by dose (median, 95% CI)", fontsize=10)
+    ax.set_title(f"ATP/ADP by {'dose' if GROUP_BY == 'dose' else 'treatment'} (median, 95% CI)", fontsize=10)
     style(ax)
     fig.tight_layout()
-    fig.savefig(os.path.join(out, "atp_by_dose.png"), dpi=FIG_DPI)
+    fig.savefig(path, dpi=FIG_DPI)
     plt.close(fig)
 
 
@@ -427,16 +494,17 @@ def plot_rate_vs_atp(tab, corr, metrics, path):
     for row, metric in enumerate(metrics):
         for col, direction in enumerate(directions):
             ax = axes[row, col]
-            t = tab[(tab["metric"] == metric) & (tab["direction"] == direction)].sort_values("dose_mM")
+            t = tab[(tab["metric"] == metric) & (tab["direction"] == direction)].sort_values("order")
+            n_all = tab["order"].max() + 1
             c = corr[(corr["metric"] == metric) & (corr["direction"] == direction)].iloc[0]
             color = REPORTER_COLORS.get(direction, "0.3")
             for i, r in enumerate(t.itertuples()):
                 ax.errorbar(r.atp_median, r.rate_median,
                             xerr=[[r.atp_median - r.atp_ci_low], [r.atp_ci_high - r.atp_median]],
                             yerr=[[r.rate_median - r.rate_ci_low], [r.rate_ci_high - r.rate_median]],
-                            fmt="o", ms=6, color=DOSE_COLORS[i % len(DOSE_COLORS)],
+                            fmt="o", ms=6, color=cond_color(r.order, n_all),
                             ecolor="0.6", capsize=3, zorder=3)
-                ax.annotate(f"{r.dose_mM:g} mM", (r.atp_median, r.rate_median), xytext=(5, 4),
+                ax.annotate(r.condition, (r.atp_median, r.rate_median), xytext=(5, 4),
                             textcoords="offset points", fontsize=7, color="0.35")
             if np.isfinite(c.slope_rate_per_atp):
                 xs = np.linspace(t["atp_ci_low"].min(), t["atp_ci_high"].max(), 50)
@@ -450,7 +518,7 @@ def plot_rate_vs_atp(tab, corr, metrics, path):
                 label = f"|{label}|"
             ax.set_ylabel(label)
             style(ax)
-    fig.suptitle("Transport rate vs ATP/ADP (dose medians, 95% bootstrap CI; permutation p over doses)",
+    fig.suptitle("Transport rate vs ATP/ADP (condition medians, 95% bootstrap CI; permutation p over conditions)",
                  fontsize=9)
     fig.tight_layout()
     fig.savefig(path, dpi=FIG_DPI)

@@ -10,6 +10,14 @@ python atp_transport_correlation.py
 
 Requires numpy, pandas and matplotlib.
 
+## Other treatments
+
+By default (`GROUP_BY = "dose"`), ATP and NCT data are matched by the mM number in the treatment text,
+which suits a 2DG dose series. For any other mix of treatments (controls, other drugs, µM doses), set
+`GROUP_BY = "treatment"`. Conditions are then matched by their full treatment label, ignoring case and
+spaces. Add `"treat_time"` or `"pyruvate"` to `TREATMENT_COLUMNS` to keep those apart, and use
+`CONDITION_ORDER` to set the plot order.
+
 ## Bulk run (no pairing)
 
 Set `BULK_ATP` and `BULK_NCT` to one or more folders. The script searches them recursively for every
