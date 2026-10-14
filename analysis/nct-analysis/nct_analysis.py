@@ -122,6 +122,10 @@ WRONG_DIR_WINDOW_S = 300.0   # wrong-direction QC: window after activation (s) .
 WRONG_DIR_MAX = 0.10         # ... cells whose median signal there moved >= this far the wrong way
                              # (import falling / export rising, as a fraction of baseline) are dropped
                              # and listed in wrong_direction_cells.csv; None turns the QC off
+JUMP_MAX = 0.30              # jump QC: bright cells whose signal changes by more than this (fraction of baseline)
+                             # between two consecutive frames are dropped (tracking errors, ROI switching cells)
+                             # and listed in jump_cells.csv; None turns the QC off
+JUMP_SKIP_FRAMES = 1         # frames right after activation not checked (fast export drops >30% there)
 
 # --- Rate plots (initial flux and model-free slope) ---------------------------
 RATE_UNIT = "per_min"        # "per_min": min^-1 (e.g. 0.072); "pct": % of baseline per min (e.g. 7.2)
@@ -559,6 +563,25 @@ def wrong_direction_qc(cells, tr, args, out):
     if len(flagged):
         print(f"  Wrong-direction QC: dropped {flagged.cell_key.nunique()} bright cells "
               f"(listed in wrong_direction_cells.csv)")
+    return cells[~bad], tr[~tr.cell_id.isin(flagged.cell_id)]
+
+
+def jump_qc(cells, tr, args, out):
+    """Drop bright cells with a frame-to-frame change > JUMP_MAX of baseline, outside the first
+    JUMP_SKIP_FRAMES frames after activation."""
+    if JUMP_MAX is None:
+        return cells, tr
+    t = tr.drop_duplicates(["cell_key", "Slice"]).sort_values(["cell_key", "Slice"])
+    step = t.groupby("cell_key").norm_corr.diff().abs()
+    skip = (t.Slice > args.activation_frame) & (t.Slice <= args.activation_frame + JUMP_SKIP_FRAMES)
+    big = step[~skip].groupby(t.cell_key[~skip]).max()
+    cells = cells.assign(max_jump=cells.cell_key.map(big).values)
+    bad = cells.bright & (cells.max_jump > JUMP_MAX)
+    flagged = cells[bad]
+    flagged[["cell_id", "source", "replicate", "reporter", "direction", "treatment", "image", "roi", "max_jump",
+             "amplitude", "flux_pct_per_min", "r2"]].to_csv(os.path.join(out, "jump_cells.csv"), index=False)
+    if len(flagged):
+        print(f"  Jump QC: dropped {flagged.cell_key.nunique()} bright cells (listed in jump_cells.csv)")
     return cells[~bad], tr[~tr.cell_id.isin(flagged.cell_id)]
 
 
@@ -1168,6 +1191,7 @@ def analyse(raw, meta, out, args):
 
     cells, tr = assign(fits, traces, meta)
     cells, tr = wrong_direction_qc(cells, tr, args, out)
+    cells, tr = jump_qc(cells, tr, args, out)
     names = list(cells.treatment.unique())
     for set_name, spec in PLOT_SETS.items():
         conds = select(names, spec)
