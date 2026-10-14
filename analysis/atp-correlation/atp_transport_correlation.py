@@ -111,6 +111,17 @@ OUTPUT_FOLDER = "atp_results"                 # batch: one subfolder per pair
 # --- ATP/ADP measurement -----------------------------------------------------
 ATP_COLUMN = "whole_cell_SN_ratio_488_405"   # also: bright_SN_ratio_488_405, nucleus_SN_ratio_488_405, *_median_*
 ATP_LABEL = "ATP/ADP (488/405)"
+# Normalise ATP/ADP to the control of each batch (each ATP file), so day-to-day offsets in the
+# sensor ratio don't mix into treatment effects: value / median(control cells in the same file).
+# A cell's treatment family is the first key below found as a word in its treatment text; its
+# control is that family's label. Treatments with no family, or whose control is missing from
+# that file, are dropped with a warning.
+ATP_NORMALIZE = True
+ATP_CONTROLS = {
+    "2DG": "0mM 2DG",
+    "MMS": "0mM MMS",
+    "gluc": "2.5mM gluc",                     # "glu" is renamed to "gluc" (TREATMENT_ALIASES)
+}
 ATP_TREATMENT_COLUMN = "treatment"            # values like "50mM 2DG"; dose is read from the number
 ATP_IMAGE_COLUMN = "image_name"               # used to count images per dose
 ATP_FILTERS = {                               # keep rows where column == value (empty dict = keep all)
@@ -303,8 +314,10 @@ def find_files(paths, file_name, parent=None):
             if not hits:
                 raise SystemExit(f"No {file_name} found under {p}")
             found += hits
-        else:
+        elif os.path.isfile(p):
             found.append(p)
+        else:
+            raise SystemExit(f"Not found: {p}")
     return found
 
 
@@ -351,7 +364,8 @@ def load_atp(atp_paths):
     files = [resolve_atp(p) for p in as_list(atp_paths)]
     for f in files:
         print(f"ATP file: {f}")
-    atp = pd.concat([read_excluding(f, EXCLUDE_ATP, "ATP") for f in files], ignore_index=True)
+    atp = pd.concat([read_excluding(f, EXCLUDE_ATP, "ATP").assign(_atp_file=f) for f in files],
+                    ignore_index=True)
     n0 = len(atp)
     for col, val in ATP_FILTERS.items():
         atp = atp[atp[col] == val]
@@ -359,8 +373,42 @@ def load_atp(atp_paths):
         atp = atp[atp[ATP_AREA_COLUMN].between(ATP_MIN_AREA_PX, ATP_MAX_AREA_PX)]
     atp = atp[np.isfinite(atp[ATP_COLUMN]) & (atp[ATP_COLUMN] > 0)].copy()
     atp = add_condition(atp, ATP_TREATMENT_COLUMN, "ATP")
+    if ATP_NORMALIZE:
+        atp = normalize_atp(atp)
     print(f"ATP: kept {len(atp)} of {n0} cells after filters")
     return atp
+
+
+def treatment_family(text):
+    text = apply_aliases(text)
+    for family in ATP_CONTROLS:
+        if re.search(rf"(?:(?<![A-Za-z])|(?<=[mun\u00b5]M)){re.escape(family)}(?![A-Za-z])", text, re.IGNORECASE):
+            return family
+    return None
+
+
+def normalize_atp(atp):
+    """Divide each cell's ratio by the median of its family's control cells in the same ATP file."""
+    atp = atp.copy()
+    atp["_family"] = atp[ATP_TREATMENT_COLUMN].map(treatment_family).fillna("")
+    ctrl_keys = {fam: norm_key(label) for fam, label in ATP_CONTROLS.items()}
+    is_ctrl = atp[ATP_TREATMENT_COLUMN].map(norm_key) == atp["_family"].map(ctrl_keys)
+    keep = pd.Series(False, index=atp.index)
+    for (f, fam), g in atp.groupby(["_atp_file", "_family"]):
+        if not fam:
+            print(f"ATP: WARNING no ATP_CONTROLS family for {sorted(g[ATP_TREATMENT_COLUMN].astype(str).unique())} "
+                  f"in {f}; {len(g)} cells dropped")
+            continue
+        ctrl = g.loc[is_ctrl[g.index], ATP_COLUMN]
+        if ctrl.empty:
+            print(f"ATP: WARNING control '{ATP_CONTROLS[fam]}' not found in {f}; {len(g)} {fam} cells dropped "
+                  f"(treatments: {sorted(g[ATP_TREATMENT_COLUMN].astype(str).unique())})")
+            continue
+        atp.loc[g.index, ATP_COLUMN] = g[ATP_COLUMN] / ctrl.median()
+        keep[g.index] = True
+        print(f"ATP: {fam} in {os.path.basename(os.path.dirname(f))}: control median {ctrl.median():.3f} "
+              f"(n={len(ctrl)})")
+    return atp[keep]
 
 
 def load_rates(folders):
@@ -504,7 +552,7 @@ def cell_mode(atp, rates, out):
             gd = g[g["cond_key"] == k]
             ax.scatter(gd[ATP_COLUMN], gd[MAIN_METRIC], s=10, alpha=0.7,
                        color=cond_color(i, len(keys)), label=labels[k])
-        ax.set_xlabel(ATP_LABEL)
+        ax.set_xlabel(atp_axis_label())
         ax.set_ylabel(RATE_METRICS[MAIN_METRIC][0])
         ax.set_title(direction)
         ax.legend(frameon=False, fontsize=8)
@@ -525,6 +573,10 @@ def style(ax):
     ax.spines[["top", "right"]].set_visible(False)
 
 
+def atp_axis_label():
+    return f"{ATP_LABEL}, / control" if ATP_NORMALIZE else ATP_LABEL
+
+
 def plot_atp(atp, atp_tab, path):
     n = len(atp_tab)
     fig, ax = plt.subplots(figsize=(max(4.5, 0.9 * n + 1.5), 4))
@@ -542,7 +594,7 @@ def plot_atp(atp, atp_tab, path):
         ax.set_xlabel("Dose (mM)")
     else:
         ax.set_xticks(range(n), atp_tab["condition"], rotation=30, ha="right", fontsize=8)
-    ax.set_ylabel(ATP_LABEL)
+    ax.set_ylabel(atp_axis_label())
     ax.set_title(f"ATP/ADP by {'dose' if GROUP_BY == 'dose' else 'treatment'} (median, 95% CI)", fontsize=10)
     style(ax)
     fig.tight_layout()
@@ -575,7 +627,7 @@ def plot_rate_vs_atp(tab, corr, metrics, path):
                 ax.plot(xs, c.slope_rate_per_atp * xs + c.intercept, color=color, lw=1.2, alpha=0.8)
             ax.set_title(f"{direction} — r = {c.pearson_r:.2f} (p = {c.pearson_perm_p:.3f}), "
                          f"rho = {c.spearman_rho:.2f}", fontsize=9)
-            ax.set_xlabel(ATP_LABEL)
+            ax.set_xlabel(atp_axis_label())
             label = RATE_METRICS[metric][0]
             if ABSOLUTE_EXPORT and direction == "export" and metric in (
                     "flux_pct_per_min", "slope_pct_per_min", "gain_at_t", "auc_frac_min"):

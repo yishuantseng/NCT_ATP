@@ -27,6 +27,15 @@ Set `BULK_ATP` and `BULK_NCT` to one or more folders. The script searches them r
 `nct_results_pooled/` are skipped so their cells aren't counted twice). It then pools all the cells and
 compares ATP/ADP with the transport rates by dose. The results go to `atp_results/bulk/`.
 
+## ATP/ADP normalisation
+
+With `ATP_NORMALIZE = True` (the default), each cell's ratio is divided by the median of its control
+cells from the same ATP file (batch). This removes day-to-day offsets in the sensor ratio before
+batches are pooled. `ATP_CONTROLS` maps each treatment family to its control, by default
+`{"2DG": "0mM 2DG", "MMS": "0mM MMS", "gluc": "2.5mM gluc"}`. A cell's family is the first key that
+appears as a word in its treatment. Cells with no family, or whose control is missing from that file,
+are dropped with a warning.
+
 ## Excluding bad data
 
 `EXCLUDE_RATES` and `EXCLUDE_ATP` drop rows from specific files. For example,
