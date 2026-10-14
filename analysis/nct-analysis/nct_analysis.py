@@ -98,6 +98,8 @@ CONTROLS = {
 
 # --- Imaging -----------------------------------------------------------------
 INTERVAL_S = 30.0            # seconds between frames
+INTENSITY = "mean"           # ROI statistic used for the traces and fits: "mean" or "median"
+                             # ("bright" always uses the mean baseline; changing this needs a full run)
 ACTIVATION_FRAME = 4         # last pre-activation frame (1-based); activation time t0 = (frame-1)*interval
 DIRECTIONS = {110: "import", 111: "export"}   # reporters not listed are guessed from the data
 EXCLUDE_REPORTERS = [185]    # reporters left out of fitting, statistics and plots
@@ -304,6 +306,7 @@ def normalise(df, args):
     df["pre_bg"] = df["cell_key"].map(pre["bg_mean"].mean())
     df["norm_mean"] = df["Mean_SN"] / (df["pre_mean"] - df["bg_mean"])
     df["norm_median"] = df["Median_SN"] / (df["pre_median"] - df["bg_mean"])
+    df["norm"] = df["norm_median"] if INTENSITY == "median" else df["norm_mean"]
     df["baseline_bgsub"] = df["pre_mean"] - df["pre_bg"]
     df["bright"] = df["baseline_bgsub"] >= args.min_baseline
     return df
@@ -333,7 +336,7 @@ def bleach_rate_preact(df, args):
     sub = df[df.bright & df.Slice.between(args.bleach_first_frame, args.activation_frame)]
     for rep, g in sub.groupby("reporter"):
         slopes = g.groupby("cell_key").apply(
-            lambda c: np.polyfit(c.time, np.log(c.norm_mean.clip(lower=1e-3)), 1)[0])
+            lambda c: np.polyfit(c.time, np.log(c.norm.clip(lower=1e-3)), 1)[0])
         b, se = -slopes.mean(), slopes.std() / np.sqrt(len(slopes))
         out[rep] = dict(b_raw=b, b=max(b, 0.0), ci_lo=b - 1.96 * se, ci_hi=b + 1.96 * se, n=len(slopes))
     return out
@@ -353,7 +356,7 @@ def bleach_rate_fit(df, args):
 
     out = {}
     for rep, g in df[df.bright].groupby("reporter"):
-        cells = [(c.time.values, c.norm_mean.values) for _, c in g.groupby("cell_key")]
+        cells = [(c.time.values, c.norm.values) for _, c in g.groupby("cell_key")]
         sse = []
         for b in grid:
             f, tot = model(b), 0.0
@@ -383,7 +386,7 @@ def per_cell(df, args, directions):
     t_slope_end = t0 + args.slope_frames * args.interval
     rows = []
     for key, c in df.groupby("cell_key"):
-        t, y, yc = c.time.values, c.norm_mean.values, c.norm_corr.values
+        t, y, yc = c.time.values, c.norm.values, c.norm_corr.values
         rep = c.reporter.iloc[0]
         sign = 1 if directions[rep] == "import" else -1
         yinf, k, r2 = fit_relax(t, yc, t0, kmax)
@@ -426,7 +429,7 @@ def per_cell(df, args, directions):
 TRACE_COLS = ["source", "row_id", "cell_key", "Image", "image_base", "roi", "Slice", "time", "reporter",
               "position", "Area", "Mean", "StdDev", "Min", "Max", "Median", "IntDen", "bg_mean", "Mean_SN",
               "Median_SN", "pre_mean", "pre_median", "baseline_bgsub", "bright", "norm_mean", "norm_median",
-              "norm_corr"]
+              "norm", "norm_corr"]
 
 
 def fit_stage(raw, out, args):
@@ -441,7 +444,7 @@ def fit_stage(raw, out, args):
     t0 = (args.activation_frame - 1) * args.interval
     for rep in reps:
         if rep not in directions:
-            late = df[(df.reporter == rep) & (df.time > t0)].norm_mean.median()
+            late = df[(df.reporter == rep) & (df.time > t0)].norm.median()
             directions[rep] = "import" if late > 1 else "export"
             print(f"Reporter {rep} not in DIRECTIONS; guessed '{directions[rep]}' from the data")
 
@@ -459,7 +462,7 @@ def fit_stage(raw, out, args):
         bleach.update({(src, r): v for r, v in est.items()})
     df["b_per_s"] = [bleach.get(k, {"b": 0.0})["b"] for k in zip(df.source, df.reporter)]
     t_ref = (args.activation_frame + 1) / 2 * args.interval - args.interval   # mid-baseline time
-    df["norm_corr"] = df.norm_mean * np.exp(df.b_per_s * (df.time - t_ref))
+    df["norm_corr"] = df.norm * np.exp(df.b_per_s * (df.time - t_ref))
     bleach_tab = pd.DataFrame([dict(source=src, reporter=r, direction=directions[r], method=args.bleach,
                                     b_pct_per_min_estimate=v["b_raw"] * 6000, b_pct_per_min_applied=v["b"] * 6000,
                                     ci_lo=v["ci_lo"] * 6000, ci_hi=v["ci_hi"] * 6000, n_cells=v["n"])
@@ -484,6 +487,8 @@ def load_cache(out):
         bleach_tab = pd.read_csv(os.path.join(out, "bleach_rates.csv"))
     except FileNotFoundError:
         raise FileNotFoundError(f"No saved fits in {cache}; run once with REASSIGN_ONLY = False first")
+    if "norm" not in traces:                     # cache written before INTENSITY existed (mean)
+        traces["norm"] = traces["norm_mean"]
     return fits, traces, bleach_tab
 
 
@@ -700,7 +705,7 @@ def timecourse_tables(df, conds):
     b = df[df.bright]
     long = (b.groupby(["reporter", "treatment", "time"])
              .agg(n=("norm_corr", "size"), mean_corr=("norm_corr", "mean"), sd_corr=("norm_corr", "std"),
-                  mean_uncorr=("norm_mean", "mean"), sd_uncorr=("norm_mean", "std"))
+                  mean_uncorr=("norm", "mean"), sd_uncorr=("norm", "std"))
              .reset_index())
     long["sem_corr"] = long.sd_corr / np.sqrt(long.n)
     long["sem_uncorr"] = long.sd_uncorr / np.sqrt(long.n)
@@ -1059,7 +1064,7 @@ def cell_plots(traces, cells, args, outdir):
         r = info.loc[key]
         fig, ax = plt.subplots(figsize=(5, 3.6))
         ax.axvspan(0, t0, color="#eee", zorder=0)
-        ax.plot(c.time, c.norm_mean, "o", ms=3, color="#aaa", label="normalised")
+        ax.plot(c.time, c.norm, "o", ms=3, color="#aaa", label="normalised")
         ax.plot(c.time, c.norm_corr, "o", ms=3.5, color=REPORTER_COLORS[r.direction], label="bleach-corrected")
         if np.isfinite(r.k_per_min):
             tt = np.linspace(t0, c.time.max(), 200)
