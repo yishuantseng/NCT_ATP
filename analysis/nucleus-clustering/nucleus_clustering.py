@@ -49,7 +49,8 @@ EXPERIMENTS = [
          rates="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/combine/nc_ratio/rates_nuc_vs_nc_per_cell.csv",
          out="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/combine/nc_ratio/nucleus_clustering"),
 ]
-POOLED_OUT = None            # folder for pooled outputs when there are several experiments (None = skip)
+POOLED_OUT = "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111/analysis/nct_results/nucleus_clustering/pooled_experiments"
+                             # folder for outputs with all experiments together (None = skip)
 MASK_FRAME = 0               # 0-based frame of the mask stack to measure (0 = first, pre-activation)
 MIN_NUC_AREA = 300           # px; smaller labels are fragments and are not counted as neighbours
 RADIUS_PX = 100              # neighbourhood radius for n_neighbors (~2 nuclear diameters)
@@ -274,6 +275,61 @@ def plot_superplot(t, rm, path):
     plt.close(fig)
 
 
+def plot_all_summary(t, corr, rm, path):
+    """All treatments together, one row per reporter: rate vs mean_dist_px, vs n_neighbors, and by
+    cluster position. Cells coloured by treatment; position panel = superplot (big dots = experiment medians)."""
+    reps = sorted(t.reporter.unique())
+    trts = [x for x in treatment_order(t) if x != ALL_LABEL]
+    units = sorted(t.unit.unique())
+    fig, axes = plt.subplots(len(reps), 3, figsize=(13, 3.6 * len(reps)), squeeze=False)
+    rng = np.random.default_rng(RANDOM_SEED)
+    for i, rep in enumerate(reps):
+        g = t[(t.reporter == rep) & (t.treatment == ALL_LABEL)]
+        g = g[g.good_fit] if rm == "k_per_min" else g[g.bright]
+        for j, cm in enumerate(["mean_dist_px", "n_neighbors"]):
+            ax = axes[i, j]
+            x = g[cm] + (rng.uniform(-0.2, 0.2, len(g)) if cm == "n_neighbors" else 0)
+            for ti, ot in enumerate(trts):
+                m = (g.orig_treatment == ot).values
+                ax.scatter(x[m], g[rm][m], s=9, alpha=0.5, color=f"C{ti}", lw=0, label=ot)
+            if cm == "n_neighbors":
+                for k, gk in g.groupby(cm):
+                    ax.plot([k - 0.3, k + 0.3], [gk[rm].median()] * 2, color="k", lw=2)
+            else:
+                ax.set_xscale("log")
+                ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+                ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+            c = corr[(corr.reporter == rep) & (corr.treatment == ALL_LABEL) & (corr.rate == rm)
+                     & (corr.cluster_metric == cm)].set_index("test")
+            txt = "; ".join(f"{lab} rho={c.stat[k]:.2f}, p={c.p[k]:.2g}" for k, lab in
+                            [("Spearman", "raw"), ("Spearman, rate centred per treatment", "centred")] if k in c.index)
+            ax.set_title(f"{rep} ({g.direction.iloc[0]}), all treatments, n={len(g)}\n{txt}", fontsize=8)
+            ax.set_xlabel(f"{cm} (mean of {K_NEAREST} nearest)" if cm == "mean_dist_px" else f"{cm} (within {RADIUS_PX} px)")
+            ax.set_ylabel(rm)
+        axes[i, 0].legend(fontsize=6, frameon=False)
+        ax = axes[i, 2]
+        for pi, pos in enumerate(POSITIONS):
+            v = g[g.cluster_position == pos]
+            ax.scatter(pi + rng.uniform(-0.15, 0.15, len(v)), v[rm], s=8, alpha=0.3, color=f"C{pi}", lw=0)
+            if len(v):
+                ax.boxplot(v[rm], positions=[pi], widths=0.5, showfliers=False,
+                           medianprops=dict(color="k"), boxprops=dict(color="k"))
+            for u, vu in v.groupby("unit"):
+                ax.scatter(pi, vu[rm].median(), s=70, edgecolor="k", zorder=3, color=f"C{len(POSITIONS) + units.index(u)}",
+                           label=u if pi == 0 else None)
+        c = corr[(corr.reporter == rep) & (corr.treatment == ALL_LABEL) & (corr.rate == rm)
+                 & (corr.cluster_metric == "cluster_position")].set_index("test")
+        ax.set_xticks(range(len(POSITIONS)))
+        ax.set_xticklabels([f"{p}\nn={(g.cluster_position == p).sum()}" for p in POSITIONS])
+        ax.set_title(f"{rep}: Kruskal p={c.p.get('Kruskal-Wallis (positions)', np.nan):.2g}; "
+                     f"middle vs edge p={c.p.get('Mann-Whitney middle vs edge', np.nan):.2g}", fontsize=8)
+        ax.set_ylabel(rm)
+        ax.legend(fontsize=6, frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def analyse(t, out):
     os.makedirs(out, exist_ok=True)
     t.to_csv(os.path.join(out, "nucleus_clustering_per_cell.csv"), index=False)
@@ -286,6 +342,8 @@ def analyse(t, out):
         for cm in SCATTER_METRICS:
             plot_scatter(t, corr, rm, cm, os.path.join(out, f"{cm}_vs_{rm}.png"))
         plot_superplot(t, rm, os.path.join(out, f"cluster_position_vs_{rm}.png"))
+        if POOL_TREATMENTS:
+            plot_all_summary(t, corr, rm, os.path.join(out, f"all_treatments_{rm}.png"))
     s = corr[(corr.rate == "flux_pct_per_min") & corr.cluster_metric.isin(SCATTER_METRICS + ["cluster_position"])]
     print(s[["reporter", "treatment", "cluster_metric", "test", "n", "stat", "p"]][s.treatment == ALL_LABEL].round(3).to_string(index=False))
     return corr

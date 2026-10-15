@@ -34,6 +34,9 @@ Outputs per experiment:
 - `clustering_vs_rate_stats.csv`
 - `mean_dist_px_vs_<rate>.png`: rate vs average distance to the nearest nuclei (log x)
 - `n_neighbors_vs_<rate>.png`: rate vs neighbour count, red bars = medians
-- `cluster_position_vs_<rate>.png`: isolated / edge / middle superplot, faint per-cell dots, unfilled boxes, big dots = per experiment+replicate medians
+- `cluster_position_vs_<rate>.png`: isolated / edge / middle superplot
+- `all_treatments_<rate>.png`: all treatments together, the three measures side by side
+
+With `POOLED_OUT` set, the same outputs are also written for all experiments together., faint per-cell dots, unfilled boxes, big dots = per experiment+replicate medians
 
 Needs numpy, pandas, scipy, matplotlib, tifffile.
