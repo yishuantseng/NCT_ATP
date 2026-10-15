@@ -44,10 +44,10 @@ EXPERIMENTS = [
          rates="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111/analysis/nct_results/rates_per_cell.csv",
          out="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111/analysis/nct_results/nucleus_clustering"),
     dict(name="20260925_MN_110,111",
-         masks="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/combine/DNA",
-         mask_suffix="_640_cp_masks.tif",
-         rates="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/combine/nc_ratio/rates_nuc_vs_nc_per_cell.csv",
-         out="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/combine/nc_ratio/nucleus_clustering"),
+         masks="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/combine/DNA/erode",
+         mask_suffix="_640_mask.tif",
+         rates="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/analysis/nct_results/rates_per_cell.csv",
+         out="/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111/analysis/nct_results/nucleus_clustering"),
 ]
 POOLED_OUT = "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111/analysis/nct_results/nucleus_clustering/pooled_experiments"
                              # folder for outputs with all experiments together (None = skip)
@@ -198,10 +198,32 @@ def treatment_order(t):
     return [x for x in trts if x != ALL_LABEL] + ([ALL_LABEL] if ALL_LABEL in trts else [])
 
 
+def add_regression(ax, x, y, logx):
+    """Least-squares line y = a + b*x (x as log10 when the axis is log), with its 95% CI band.
+    Returns a label with the slope and the Pearson r and p of the fit."""
+    ok = np.isfinite(x) & np.isfinite(y) & ((x > 0) if logx else True)
+    x, y = np.asarray(x[ok], float), np.asarray(y[ok], float)
+    if len(x) < 5:
+        return ""
+    xf = np.log10(x) if logx else x
+    fit = stats.linregress(xf, y)
+    grid = np.linspace(xf.min(), xf.max(), 100)
+    pred = fit.intercept + fit.slope * grid
+    resid = y - (fit.intercept + fit.slope * xf)
+    se = np.sqrt((resid ** 2).sum() / (len(x) - 2)) * np.sqrt(
+        1 / len(x) + (grid - xf.mean()) ** 2 / ((xf - xf.mean()) ** 2).sum())
+    tcrit = stats.t.ppf(0.975, len(x) - 2)
+    gx = 10 ** grid if logx else grid
+    ax.plot(gx, pred, color="k", lw=1.5)
+    ax.fill_between(gx, pred - tcrit * se, pred + tcrit * se, color="k", alpha=0.12, lw=0)
+    unit = "per log10 unit" if logx else "per unit"
+    return f"fit slope={fit.slope:.2g} {unit}, r={fit.rvalue:.2f}, p={fit.pvalue:.2g}"
+
+
 def plot_scatter(t, corr, rm, cm, path):
     reps = sorted(t.reporter.unique())
     trts = treatment_order(t)
-    fig, axes = plt.subplots(len(reps), len(trts), figsize=(3.2 * len(trts), 3 * len(reps)), squeeze=False)
+    fig, axes = plt.subplots(len(reps), len(trts), figsize=(3.4 * len(trts), 3.3 * len(reps)), squeeze=False)
     rng = np.random.default_rng(RANDOM_SEED)
     for i, rep in enumerate(reps):
         for j, trt in enumerate(trts):
@@ -220,10 +242,11 @@ def plot_scatter(t, corr, rm, cm, path):
             if discrete:
                 for k, gk in g.groupby(cm):
                     ax.plot([k - 0.3, k + 0.3], [gk[rm].median()] * 2, color="C3", lw=2)
+            reg = add_regression(ax, g[cm], g[rm], cm.endswith("_px"))
             c = corr[(corr.reporter == rep) & (corr.treatment == trt) & (corr.rate == rm)
                      & (corr.cluster_metric == cm) & (corr.test == "Spearman")]
-            txt = f"rho={c.stat.iloc[0]:.2f}, p={c.p.iloc[0]:.2g}, n={c.n.iloc[0]}" if len(c) else ""
-            ax.set_title(f"{rep} {g.direction.iloc[0] if len(g) else ''} | {trt}\n{txt}", fontsize=9)
+            txt = f"Spearman rho={c.stat.iloc[0]:.2f}, p={c.p.iloc[0]:.2g}, n={c.n.iloc[0]}" if len(c) else ""
+            ax.set_title(f"{rep} {g.direction.iloc[0] if len(g) else ''} | {trt}\n{txt}\n{reg}", fontsize=8)
             if cm.endswith("_px"):
                 ax.set_xscale("log")
                 ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
@@ -299,11 +322,12 @@ def plot_all_summary(t, corr, rm, path):
                 ax.set_xscale("log")
                 ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
                 ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+            reg = add_regression(ax, g[cm], g[rm], cm == "mean_dist_px")
             c = corr[(corr.reporter == rep) & (corr.treatment == ALL_LABEL) & (corr.rate == rm)
                      & (corr.cluster_metric == cm)].set_index("test")
             txt = "; ".join(f"{lab} rho={c.stat[k]:.2f}, p={c.p[k]:.2g}" for k, lab in
                             [("Spearman", "raw"), ("Spearman, rate centred per treatment", "centred")] if k in c.index)
-            ax.set_title(f"{rep} ({g.direction.iloc[0]}), all treatments, n={len(g)}\n{txt}", fontsize=8)
+            ax.set_title(f"{rep} ({g.direction.iloc[0]}), all treatments, n={len(g)}\nSpearman {txt}\n{reg}", fontsize=8)
             ax.set_xlabel(f"{cm} (mean of {K_NEAREST} nearest)" if cm == "mean_dist_px" else f"{cm} (within {RADIUS_PX} px)")
             ax.set_ylabel(rm)
         axes[i, 0].legend(fontsize=6, frameon=False)

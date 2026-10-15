@@ -33,6 +33,9 @@ Outputs per experiment:
 - `nucleus_clustering_per_cell.csv`: rates plus clustering metrics per cell
 - `clustering_vs_rate_stats.csv`
 - `mean_dist_px_vs_<rate>.png`: rate vs average distance to the nearest nuclei (log x)
+
+Scatter plots carry a least-squares regression line with its 95% CI band (fitted on log10 distance
+for the log-scaled distance axis) and report its slope, Pearson r and p next to the Spearman rho.
 - `n_neighbors_vs_<rate>.png`: rate vs neighbour count, red bars = medians
 - `cluster_position_vs_<rate>.png`: isolated / edge / middle superplot
 - `all_treatments_<rate>.png`: all treatments together, the three measures side by side
