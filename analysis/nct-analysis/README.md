@@ -156,3 +156,13 @@ Edit the PARAMETERS block at the top of the file, then run `python3 nct_analysis
   - `export_vs_import_k.png`, `_flux.png`, `_slope.png`: export rate (x) vs import rate (y) per treatment, as median ± SD. Once every treatment has ≥ 2 experiment + replicate medians, the large dot becomes their mean ± SD.
   - `cell_plots/<reporter>_<treatment>/` when `SAVE_CELL_PLOTS = True`: each cell's trace with its fitted exponential.
 - `script_output/` holds the output of the earlier command-line version.
+
+## Fine-tuning figures: `nct_figures.py`
+
+After a run of `nct_analysis.py` (usually the pooled one), `nct_figures.py` redraws chosen figures from its outputs (`rates_per_cell.csv`, `timecourses_long.csv`) without refitting. At the top of the script:
+
+- `RESULTS_FOLDER` (default `nct_results_pooled`), `OUTPUT_FOLDER` (default `figures`, inside it), `FORMATS` (png and pdf) and `DPI`.
+- `FIGURES`: one entry per figure, with `name`, `kind` (`metric`, `timecourse`, `rate_scatter` or `pct_well_fit`), `metric` (`flux`, `slope`, `k` or `half_time`), `reporter`, `treatments` (which groups, in plot order) and `control`.
+- Optional per figure (defaults in `DEFAULTS`): `ylim`, `xlim` (use `None` for one free end, e.g. `(0, None)`), `figsize`, `title`, `ylabel`, `xlabel`, `labels` (rename x ticks), `show_n`, `stars`, `stats_unit`, and `error` (`sem`/`sd`, timecourses).
+
+Statistics are recomputed for each figure's own treatments and control, using the same tests as `nct_analysis.py`. The script imports `nct_analysis.py` for its style and statistics, so keep both in the same folder.
