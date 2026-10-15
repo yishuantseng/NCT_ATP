@@ -23,7 +23,10 @@ the rates by reporter, file id, XY position and ROI. The rates file can be `rate
 `NC_RATES_READOUT`; wrong-direction cells dropped; well-fit = r2 >= `MIN_R2` and k below its cap).
 
 Stats per reporter x treatment: Spearman of each rate against each clustering metric, Kruskal-Wallis
-across isolated/edge/middle, and Mann-Whitney middle vs edge. Flux and slope use bright cells; k uses well-fit cells.
+across isolated/edge/middle, and Mann-Whitney middle vs edge. With `POOL_TREATMENTS = True` every
+reporter also gets an `all` group (all treatments together; the pooled scatter colours cells by
+treatment), plus a Spearman with each cell's rate centred on its own treatment median, so a dose
+effect on both crowding and rate can't drive the pooled correlation. Flux and slope use bright cells; k uses well-fit cells.
 
 Each `EXPERIMENTS` entry is one experiment (name, mask folder + suffix, rates CSV, output folder).
 Outputs per experiment:

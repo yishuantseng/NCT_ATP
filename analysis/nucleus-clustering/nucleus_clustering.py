@@ -27,6 +27,7 @@ import re
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 import pandas as pd
 import tifffile
@@ -64,6 +65,8 @@ NC_RATES_READOUT = "nuclear"   # nc_rates.py files only: "nuclear" or "N/C"
 NC_RATES_TREATMENT = "{dose}mM 2DG"   # nc_rates.py files only: treatment label from dose_mM
 MIN_R2 = 0.5                 # nc_rates.py files only: well-fit = r2 >= MIN_R2 and k below its cap
 K_CAP_PER_MIN = 2.0          # nc_rates.py files only: k cap (1/30 s)
+POOL_TREATMENTS = True       # also analyse all treatments together (per reporter) as an extra "all" group
+ALL_LABEL = "all"
 DEFAULT_REPLICATE = "A"
 RANDOM_SEED = 0
 # ----------------------------------------------------------------------------
@@ -165,6 +168,13 @@ def correlations(t):
                     rho, p = stats.spearmanr(x[cm], x[rm])
                     out.append(dict(reporter=rep, direction=direc, treatment=trt, rate=rm, cluster_metric=cm,
                                     test="Spearman", n=len(x), stat=rho, p=p))
+                if trt == ALL_LABEL:   # also with each cell's rate centred on its own treatment median
+                    x = cells[[cm, rm, "orig_treatment"]].dropna()
+                    y = x[rm] - x.groupby("orig_treatment")[rm].transform("median")
+                    if len(x) >= 5:
+                        rho, p = stats.spearmanr(x[cm], y)
+                        out.append(dict(reporter=rep, direction=direc, treatment=trt, rate=rm, cluster_metric=cm,
+                                        test="Spearman, rate centred per treatment", n=len(x), stat=rho, p=p))
             grp = {pos: cells.loc[cells.cluster_position == pos, rm].dropna() for pos in POSITIONS}
             grp = {k: v for k, v in grp.items() if len(v) >= 3}
             med = {f"median_{k}": v.median() for k, v in grp.items()}
@@ -183,7 +193,8 @@ def correlations(t):
 
 
 def treatment_order(t):
-    return list(t.sort_values("dose_mM").treatment.unique()) if "dose_mM" in t else sorted(t.treatment.unique())
+    trts = list(t.sort_values("dose_mM").treatment.unique()) if "dose_mM" in t else sorted(t.treatment.unique())
+    return [x for x in trts if x != ALL_LABEL] + ([ALL_LABEL] if ALL_LABEL in trts else [])
 
 
 def plot_scatter(t, corr, rm, cm, path):
@@ -198,16 +209,24 @@ def plot_scatter(t, corr, rm, cm, path):
             g = g[g.good_fit] if rm == "k_per_min" else g[g.bright]
             discrete = cm in ("n_neighbors", "cluster_size")
             x = g[cm] + (rng.uniform(-0.2, 0.2, len(g)) if discrete else 0)
-            ax.scatter(x, g[rm], s=10, alpha=0.4, color="0.3", lw=0)
+            if trt == ALL_LABEL:   # pooled panel: colour cells by their own treatment
+                for ti, ot in enumerate(trts[:-1]):
+                    m = (g.orig_treatment == ot).values
+                    ax.scatter(x[m], g[rm][m], s=10, alpha=0.5, color=f"C{ti}", lw=0, label=ot)
+                ax.legend(fontsize=6, frameon=False)
+            else:
+                ax.scatter(x, g[rm], s=10, alpha=0.4, color="0.3", lw=0)
             if discrete:
                 for k, gk in g.groupby(cm):
                     ax.plot([k - 0.3, k + 0.3], [gk[rm].median()] * 2, color="C3", lw=2)
             c = corr[(corr.reporter == rep) & (corr.treatment == trt) & (corr.rate == rm)
-                     & (corr.cluster_metric == cm)]
+                     & (corr.cluster_metric == cm) & (corr.test == "Spearman")]
             txt = f"rho={c.stat.iloc[0]:.2f}, p={c.p.iloc[0]:.2g}, n={c.n.iloc[0]}" if len(c) else ""
             ax.set_title(f"{rep} {g.direction.iloc[0] if len(g) else ''} | {trt}\n{txt}", fontsize=9)
             if cm.endswith("_px"):
                 ax.set_xscale("log")
+                ax.xaxis.set_major_formatter(matplotlib.ticker.ScalarFormatter())
+                ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
             ax.set_xlabel(f"{cm} (within {RADIUS_PX} px)" if cm == "n_neighbors" else cm)
             ax.set_ylabel(rm)
     fig.tight_layout()
@@ -258,6 +277,9 @@ def plot_superplot(t, rm, path):
 def analyse(t, out):
     os.makedirs(out, exist_ok=True)
     t.to_csv(os.path.join(out, "nucleus_clustering_per_cell.csv"), index=False)
+    t = t.assign(orig_treatment=t.treatment)
+    if POOL_TREATMENTS:
+        t = pd.concat([t, t.assign(treatment=ALL_LABEL, dose_mM=np.inf)], ignore_index=True)
     corr = correlations(t)
     corr.to_csv(os.path.join(out, "clustering_vs_rate_stats.csv"), index=False)
     for rm in RATE_METRICS:
@@ -265,7 +287,7 @@ def analyse(t, out):
             plot_scatter(t, corr, rm, cm, os.path.join(out, f"{cm}_vs_{rm}.png"))
         plot_superplot(t, rm, os.path.join(out, f"cluster_position_vs_{rm}.png"))
     s = corr[(corr.rate == "flux_pct_per_min") & corr.cluster_metric.isin(SCATTER_METRICS + ["cluster_position"])]
-    print(s[["reporter", "treatment", "cluster_metric", "test", "n", "stat", "p"]].round(3).to_string(index=False))
+    print(s[["reporter", "treatment", "cluster_metric", "test", "n", "stat", "p"]][s.treatment == ALL_LABEL].round(3).to_string(index=False))
     return corr
 
 
