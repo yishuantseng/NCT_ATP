@@ -18,15 +18,16 @@ WHAT IT DOES (per image = one XY field)
      of skeleton at least MIN_SEGMENT_LENGTH_PX long is one "segment" (a stretch of one neurite
      between crossings). Mask pixels go to their nearest segment.
   5. Ratio: pixels with enough signal in both channels (MIN_SNR x background noise) are used.
-     ratio = sum(488 - bg) / sum(405 - bg)  (intensity-weighted, robust for dim pixels);
-     the median of the per-pixel ratio is also saved.
+     ratio_median = median of the per-pixel 488/405 ratio (plotted by default, RATIO_COLUMN);
+     ratio_sum = sum(488 - bg) / sum(405 - bg) (intensity-weighted) is also saved.
   6. Normalisation: each value is divided by the median of its batch's control (per experiment
      folder, see ATP_CONTROLS / MATCH_TREAT_TIME).
 
   Neurites in these fields form a dense network with no somata, so single cells cannot be
   followed; the per-"cell" unit here is the neurite segment.
 
-OUTPUTS (in <experiment>/OUTPUT_SUBFOLDER; POOLED_OUTPUT gets the combined tables and plots)
+OUTPUTS (in <experiment>/OUTPUT_SUBFOLDER; with several folders, POOLED_OUTPUT gets the combined
+         tables and plots, one big dot per experiment + replicate)
   neurite_segments.csv     one row per segment: image, treatment, length, intensities, ratios
   neurite_images.csv       one row per image: whole-mask ratio, n segments, background, coverage
   summary_by_treatment.csv per treatment: n images / segments, medians of raw and normalised ratio
@@ -42,10 +43,18 @@ OUTPUTS (in <experiment>/OUTPUT_SUBFOLDER; POOLED_OUTPUT gets the combined table
 # =============================================================================
 
 # --- Which data to analyse ---------------------------------------------------
-# One folder per experiment. Images are read from <folder>/IMAGE_SUBFOLDER.
+# Batch: one folder per experiment. Images are read from <folder>/IMAGE_SUBFOLDER.
+# List experiment folders here, and/or put parent folders in BATCH_ROOTS: every folder below them
+# (up to SEARCH_DEPTH levels) whose IMAGE_SUBFOLDER holds FILE_PREFIX images is added.
+# Folders whose name contains a word in SKIP_FOLDERS are left out.
 EXPERIMENT_FOLDERS = [
     "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261002_MN_92",
 ]
+BATCH_ROOTS = [
+    # "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12",
+]
+SEARCH_DEPTH = 2
+SKIP_FOLDERS = []
 IMAGE_SUBFOLDER = "tif"
 FILE_PREFIX = "neurite_"                      # only images whose name starts with this
 ATP_SUFFIX = "_488.tif"                       # 488 nm excitation (ATP-bound)
@@ -59,8 +68,9 @@ TIME_COLUMN = "treat_time"                    # "" if there is none
 DEFAULT_REPLICATE = "A"
 
 OUTPUT_SUBFOLDER = "analysis/neurite_atp"     # per experiment, created inside the experiment folder
-POOLED_OUTPUT = ""                            # folder for the combined results of all experiments
-                                              # ("" = the first experiment's output folder)
+POOLED_OUTPUT = ""                            # folder for the combined results of all experiments (batch)
+                                              # ("" = <first BATCH_ROOT>/neurite_atp_pooled, or
+                                              #  <first experiment>/OUTPUT_SUBFOLDER/pooled)
 
 # --- Normalisation -----------------------------------------------------------
 NORMALIZE = True
@@ -90,7 +100,8 @@ SEGMENT_MAX_DIST_PX = 6                       # mask pixels further than this fr
 MIN_SEGMENT_PIXELS = 30                       # segments with fewer usable pixels are dropped
 
 # --- Plots -------------------------------------------------------------------
-RATIO_COLUMN = "ratio_sum"                    # "ratio_sum" (sum 488 / sum 405) or "ratio_median"
+RATIO_COLUMN = "ratio_median"                 # "ratio_median" (median of per-pixel 488/405) or
+                                              # "ratio_sum" (sum 488 / sum 405, intensity-weighted)
 TREATMENT_ORDER = []                          # plot order of "treatment | treat_time" labels; [] = automatic
 SAVE_OVERLAYS = True
 FIG_DPI = 200
@@ -301,7 +312,7 @@ def run_experiment(folder):
         for r in rows:
             r["length_um"] = r["length_px"] * um
             seg_rows.append({**meta, **r})
-        print(f"  {base}: {len(rows)} segments, ratio {img['ratio_sum'] if img else np.nan:.3f}")
+        print(f"  {base}: {len(rows)} segments, ratio {img[RATIO_COLUMN] if img else np.nan:.3f}")
     segs, imgs = pd.DataFrame(seg_rows), pd.DataFrame(img_rows)
     for df in (segs, imgs):
         df["condition"] = df["treatment"] + (" | " + df["treat_time"]).where(df["treat_time"] != "", "")
@@ -439,7 +450,7 @@ def superplot(df, val, ylab, path, image_medians, title):
                    medianprops={"color": "k"}, boxprops={"color": "k"},
                    whiskerprops={"color": "k"}, capprops={"color": "k"}, zorder=2)
         if image_medians:
-            im = g.groupby("image")[val].median()
+            im = g.groupby(["experiment", "image"])[val].median()
             ax.scatter(np.full(len(im), i + 0.33), im, s=14, facecolors="none", edgecolors="tab:blue",
                        linewidths=0.8, zorder=3, label="image median" if i == 0 else None)
         for j, key in enumerate(groups):
@@ -478,15 +489,52 @@ def qc_ratio_vs_intensity(segs, path):
     plt.close(fig)
 
 
+def has_images(folder):
+    d = os.path.join(folder, IMAGE_SUBFOLDER)
+    return os.path.isdir(d) and any(f.startswith(FILE_PREFIX) and f.endswith(ATP_SUFFIX) for f in os.listdir(d))
+
+
+def find_experiments():
+    found = [here(f) for f in EXPERIMENT_FOLDERS]
+    for root in BATCH_ROOTS:
+        root = here(root)
+        base = root.rstrip(os.sep).count(os.sep)
+        for d, subs, _ in os.walk(root):
+            if d.count(os.sep) - base >= SEARCH_DEPTH:
+                subs[:] = []
+            subs[:] = [x for x in subs if not x.startswith(".") and x != IMAGE_SUBFOLDER]
+            if has_images(d):
+                found.append(d)
+    out = []
+    for f in found:
+        name = os.path.basename(os.path.normpath(f))
+        if f in out or any(w in name for w in SKIP_FOLDERS):
+            continue
+        if not has_images(f):
+            print(f"! skipped {f}: no {FILE_PREFIX}*{ATP_SUFFIX} in {IMAGE_SUBFOLDER}/")
+            continue
+        out.append(f)
+    return out
+
+
 def main():
+    folders = find_experiments()
+    print(f"{len(folders)} experiment folder(s):")
+    for f in folders:
+        print("  " + f)
     all_s, all_i = [], []
-    for folder in EXPERIMENT_FOLDERS:
-        s, i = run_experiment(here(folder))
-        all_s.append(s)
-        all_i.append(i)
-    if len(EXPERIMENT_FOLDERS) > 1:
-        pooled = here(POOLED_OUTPUT) if POOLED_OUTPUT else os.path.join(here(EXPERIMENT_FOLDERS[0]),
-                                                                          OUTPUT_SUBFOLDER, "pooled")
+    for folder in folders:
+        s, i = run_experiment(folder)
+        if len(s):
+            all_s.append(s)
+            all_i.append(i)
+    if len(all_s) > 1:
+        if POOLED_OUTPUT:
+            pooled = here(POOLED_OUTPUT)
+        elif BATCH_ROOTS:
+            pooled = os.path.join(here(BATCH_ROOTS[0]), "neurite_atp_pooled")
+        else:
+            pooled = os.path.join(folders[0], OUTPUT_SUBFOLDER, "pooled")
         os.makedirs(pooled, exist_ok=True)
         segs, imgs = pd.concat(all_s, ignore_index=True), pd.concat(all_i, ignore_index=True)
         segs.to_csv(os.path.join(pooled, "neurite_segments.csv"), index=False)
