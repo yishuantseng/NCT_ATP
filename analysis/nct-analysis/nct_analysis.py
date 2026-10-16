@@ -20,7 +20,8 @@ PIPELINE
   1. Parse labels and attach per-frame background; reporter per image comes from META_FILE.
   2. Keep ROIs tracked through every frame with area >= MIN_AREA_PX.
   3. Normalise: norm(t) = (Mean(t) - bg(t)) / (mean(Mean, frames 1..A) - bg(t)), A = activation frame.
-  4. QC: "bright" cells have baseline - bg >= MIN_BASELINE grey levels.
+  4. QC: "bright" cells have baseline - bg >= MIN_BASELINE grey levels. Later (report stage) bright cells
+     are dropped if they move the wrong way, jump between frames or fit badly (RMSE > MAX_RMSE).
   5. Photobleaching: one rate b per experiment (folder) x reporter, from the pre-activation frames ("preact"),
      fitted across cells ("fit"), or none. Trace is multiplied by exp(b * t).
   6. Per-cell fit from activation (t0 = (A-1) * interval):
@@ -41,26 +42,45 @@ PIPELINE
 # Batch: list one folder per experiment (the folder name is the experiment name). The three input
 # files are read from <folder>/<BATCH_DATA_SUBFOLDER> ("" = the folder itself).
 DATA_FOLDER = "inputs"
+#2DG
 BATCH_FOLDERS = [
     "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260925_MN_110,111",
-    "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260930_MN_110,111",
+    #"/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/07-09/20260930_MN_110,111",
     "/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111",
 ]
+
+'''BATCH_FOLDERS = [
+    '/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250702_MN_glu_110,111',
+    #'/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250709_MN_glu_110,111',#data was noisy and flucuated a lot
+    '/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250718_MN_glu_110,111',
+    '/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Jul-Sep/20250813_MN_glu_110,111',
+    #'/Volumes/Holtlab_YST/Yi-Shuan/microscope/2025/Oct-Dec/20251215_MN_glu_110,111/analysis/PA_analysis', #need to double check 2.5mM gluc group
+    '/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260220_MN_glu_110,111',
+    '/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260227_MN_glu_110,111',
+    '/Volumes/Holtlab_YST/Yi-Shuan/microscope/2026/01-03/20260318_MN_glu_110,111',
+    '/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260325_MN_glu_110,111,185',
+    '/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/01-03/20260327_MN_glu_110,111,185',
+    #'/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/04-06/20260508_MN_110,111/analysis/' # this is without pyruvate,
+    '/Volumes/holtl02lab/holtl02labspace/Holt_Lab_Members/Yi-Shuan/microscope/2026/10-12/20261010_MN_110,111',
+]'''
+
+
 BATCH_DATA_SUBFOLDER = "analysis"
 COMBINE_BATCH = True         # True: also run one pooled analysis of all BATCH_FOLDERS together
-POOLED_ONLY = False          # True: run only the pooled analysis (the folders are still read, but their
+POOLED_ONLY = False         # True: run only the pooled analysis (the folders are still read, but their
                              # own outputs are not redone); combine with REASSIGN_ONLY for a fast rerun
+
+
+# Results go to <data folder>/<OUTPUT_SUBFOLDER>; the pooled batch run goes to POOLED_OUTPUT
+# (a relative POOLED_OUTPUT is placed next to this script).
+OUTPUT_SUBFOLDER = "nct_results"
+POOLED_OUTPUT = "nct_results_pooled/2DG"
 
 # File names inside each folder. Wildcards are allowed (e.g. "*combined_Results*.csv"),
 # but each pattern must match exactly one file.
 RESULTS_FILE = "combined_Results.csv"
 BG_FILE = "mCherry_BGInt_Results.csv"
 META_FILE = "fileid_treatment.csv"
-
-# Results go to <data folder>/<OUTPUT_SUBFOLDER>; the pooled batch run goes to POOLED_OUTPUT
-# (a relative POOLED_OUTPUT is placed next to this script).
-OUTPUT_SUBFOLDER = "nct_results"
-POOLED_OUTPUT = "nct_results_pooled"
 
 # --- Rerun only the treatment assignment ---------------------------------------
 # True: skip loading the measurements and fitting; reuse the per-cell fits saved by the last full run
@@ -81,9 +101,9 @@ TREATMENT_REPLACE = {r"glu(?![a-z])": "gluc"}
 #   "text"                   -> every treatment whose name contains "text" (case-insensitive)
 #   ["name 1", "name 2", ...] -> exactly these treatments, in this order
 PLOT_SETS = {
-    "all": None,
-    # "2DG": "2DG",
-    # "gluc": ["2.5mM gluc", "0.15mM gluc", "0mM gluc+FCCP+2DG"],
+    #"all": None,
+    "2DG": "2DG",
+    #"gluc": ["2.5mM gluc", "0.15mM gluc", "0mM gluc", "0mM gluc+FCCP+2DG"],
     # "MMS": "MMS",
 }
 # Order of treatments on the x axis (for sets given as None or "text"). Treatments listed here come
@@ -92,9 +112,16 @@ TREATMENT_ORDER = []
 # Control (reference) treatment per plot set, for the statistics and "% of control".
 # A set without an entry uses its first treatment.
 CONTROLS = {
-    # "gluc": "2.5mM gluc",
+    #"gluc": "2.5mM gluc",
     "2DG": "0mM 2DG"
 }
+# Separate plots for each combination of these META_FILE columns (subfolders like 1h_continuous/).
+# A column with a single value in the data is left out of the folder name; with one group, outputs go
+# straight to the output folder. rates_per_cell.csv with all cells is also written there.
+SPLIT_BY = ["treat_time", "type"]
+SPLIT_FILL = {"type": "no-change"}           # value for cells whose meta file has no such column / value
+# Left out of the pooled analysis only (each folder's own analysis keeps them).
+POOLED_EXCLUDE = {"type": ["continuous", "recurrent"]}
 
 # --- Imaging -----------------------------------------------------------------
 INTERVAL_S = 30.0            # seconds between frames
@@ -126,6 +153,10 @@ JUMP_MAX = 0.30              # jump QC: bright cells whose signal changes by mor
                              # between two consecutive frames are dropped (tracking errors, ROI switching cells)
                              # and listed in jump_cells.csv; None turns the QC off
 JUMP_SKIP_FRAMES = 1         # frames right after activation not checked (fast export drops >30% there)
+MAX_RMSE = 0.05              # fit QC: bright cells whose trace scatters around the exponential fit by more than
+                             # this (RMSE after activation, fraction of baseline; typical 0.015-0.025) are dropped
+                             # and listed in rmse_cells.csv; unlike R^2 it doesn't penalise small responses.
+                             # None turns the QC off
 
 # --- Rate plots (initial flux and model-free slope) ---------------------------
 RATE_UNIT = "per_min"        # "per_min": min^-1 (e.g. 0.072); "pct": % of baseline per min (e.g. 7.2)
@@ -152,6 +183,13 @@ RATE_SCATTER_METRICS = ["k_per_min", "flux_pct_per_min", "slope_pct_per_min"]   
                                     # k (well-fit cells), initial flux and model-free slope (bright cells; export sign flipped)
 RATE_SCATTER_ERROR = "auto"         # "units": SD of experiment+replicate medians; "cells": SD across cells;
                                     # "auto": units when every treatment has >= 2 units, otherwise cells
+RATE_SCATTER_CI = True              # also save export_vs_import_<metric>_ci95.png: median of cells with a
+                                    # 95% percentile-bootstrap CI (same style as the ATP/ADP correlation plots)
+RATE_SCATTER_CI_RESAMPLE = "cells"  # "cells": resample cells within the treatment (CI of the median given
+                                    # cell-to-cell scatter); "hierarchical": resample experiment+replicate
+                                    # units, then cells within each (wider; reflects day-to-day variation)
+N_BOOT = 2000                       # bootstrap resamples
+BOOT_SEED = 1
 
 # --- Per-cell plots ----------------------------------------------------------
 SAVE_CELL_PLOTS = False      # one PNG per cell: trace + fitted exponential (slow for many cells)
@@ -335,13 +373,16 @@ def fit_relax(t, y, t0, kmax):
 
 
 def bleach_rate_preact(df, args):
-    """Per-reporter b (1/s) = -(mean per-cell slope of ln(norm)) over pre-activation frames."""
+    """Per-reporter b (1/s) = -(median per-cell slope of ln(norm)) over pre-activation frames.
+    The median (not the mean) keeps a few glitched cells (e.g. a field with a one-frame focus drop)
+    from setting the bleaching rate of the whole experiment."""
     out = {}
     sub = df[df.bright & df.Slice.between(args.bleach_first_frame, args.activation_frame)]
     for rep, g in sub.groupby("reporter"):
         slopes = g.groupby("cell_key").apply(
             lambda c: np.polyfit(c.time, np.log(c.norm.clip(lower=1e-3)), 1)[0])
-        b, se = -slopes.mean(), slopes.std() / np.sqrt(len(slopes))
+        mad = 1.4826 * (slopes - slopes.median()).abs().median()      # robust SD
+        b, se = -slopes.median(), 1.2533 * mad / np.sqrt(len(slopes))  # SE of the median
         out[rep] = dict(b_raw=b, b=max(b, 0.0), ci_lo=b - 1.96 * se, ci_hi=b + 1.96 * se, n=len(slopes))
     return out
 
@@ -518,7 +559,7 @@ def assign(fits, traces, meta):
     """Attach treatments: one row per cell x treatment (cells of an image with several treatments
     are used in each of them)."""
     m = meta[["source", "image_base", "reporter", "treatment", "replicate"]
-             + [c for c in ["treat_time", "pyruvate"] if c in meta]]
+             + [c for c in dict.fromkeys(["treat_time", "pyruvate"] + SPLIT_BY) if c in meta]]
     check = fits[["source", "image_base", "reporter"]].drop_duplicates().merge(
         m[["source", "image_base", "reporter"]].drop_duplicates(), on=["source", "image_base"],
         how="left", suffixes=("", "_meta"))
@@ -533,6 +574,10 @@ def assign(fits, traces, meta):
     m = m.drop(columns="reporter")
     cells = fits.merge(m, on=["source", "image_base"], how="inner")
     cells = cells[~cells.reporter.isin(EXCLUDE_REPORTERS)]
+    for col in SPLIT_BY:
+        if col not in cells:
+            cells[col] = np.nan
+        cells[col] = cells[col].fillna(SPLIT_FILL.get(col, "unknown")).astype(str).str.strip()
     cells["cell_id"] = cells.cell_key + " | " + cells.treatment
     cells["unit"] = cells.source + "_" + cells.replicate
     cells["dose_mM"] = cells.treatment.str.extract(r"([\d.]+)\s*mM")[0].astype(float)
@@ -582,6 +627,27 @@ def jump_qc(cells, tr, args, out):
              "amplitude", "flux_pct_per_min", "r2"]].to_csv(os.path.join(out, "jump_cells.csv"), index=False)
     if len(flagged):
         print(f"  Jump QC: dropped {flagged.cell_key.nunique()} bright cells (listed in jump_cells.csv)")
+    return cells[~bad], tr[~tr.cell_id.isin(flagged.cell_id)]
+
+
+def rmse_qc(cells, tr, args, out):
+    """Drop bright cells whose bleach-corrected trace scatters around its exponential fit (from
+    activation on) with RMSE > MAX_RMSE (badly tracked or noisy cells)."""
+    t0 = (args.activation_frame - 1) * args.interval
+    t = tr[tr.time >= t0].drop_duplicates(["cell_key", "Slice"])
+    fit = cells.drop_duplicates("cell_key").set_index("cell_key")
+    yinf, k = t.cell_key.map(fit.y_inf), t.cell_key.map(fit.k_per_min) / 60
+    res2 = (t.norm_corr - (yinf + (1 - yinf) * np.exp(-k * (t.time - t0)))) ** 2
+    cells = cells.assign(rmse=cells.cell_key.map(res2.groupby(t.cell_key).mean() ** 0.5).values)
+    if MAX_RMSE is None:
+        return cells, tr
+    bad = cells.bright & (cells.rmse > MAX_RMSE)
+    flagged = cells[bad]
+    flagged[["cell_id", "source", "replicate", "reporter", "direction", "treatment", "image", "roi", "rmse",
+             "amplitude", "flux_pct_per_min", "r2"]].to_csv(os.path.join(out, "rmse_cells.csv"), index=False)
+    if len(flagged):
+        print(f"  Fit RMSE QC: dropped {flagged.cell_key.nunique()} bright cells with RMSE > {MAX_RMSE:g} "
+              f"(listed in rmse_cells.csv)")
     return cells[~bad], tr[~tr.cell_id.isin(flagged.cell_id)]
 
 
@@ -1015,10 +1081,25 @@ RATE_NAMES = {"k_per_min": ("k", "min⁻¹", "k"),
               "slope_pct_per_min": ("model-free slope", "% of baseline per min", "slope")}
 
 
-def fig_rate_scatter(cells, conds, directions, metric, path):
+def boot_median_ci(df, rng):
+    """95% percentile-bootstrap CI of the median of df.v; resampling per RATE_SCATTER_CI_RESAMPLE."""
+    v = df.v.to_numpy()
+    if RATE_SCATTER_CI_RESAMPLE == "hierarchical" and df.unit.nunique() > 1:
+        groups = [g.v.to_numpy() for _, g in df.groupby("unit")]
+        meds = np.empty(N_BOOT)
+        for b in range(N_BOOT):
+            pick = rng.integers(0, len(groups), len(groups))
+            meds[b] = np.median(np.concatenate([rng.choice(groups[i], len(groups[i])) for i in pick]))
+    else:
+        meds = np.median(rng.choice(v, (N_BOOT, len(v))), axis=1)
+    return np.percentile(meds, [2.5, 97.5])
+
+
+def fig_rate_scatter(cells, conds, directions, metric, path, err=None):
     """Export rate (x) vs import rate (y) per treatment. Faint dots: median of each experiment + replicate
     (import and export paired by experiment, replicate and treatment). Large dot: mean of those medians
-    (or the cell median when error = cells) with ± SD error bars."""
+    (or the cell median when error = cells) with ± SD error bars; err = "ci95": median of cells with a
+    95% bootstrap CI."""
     imp = [r for r, d in directions.items() if d == "import" and r in set(cells.reporter)]
     exp = [r for r, d in directions.items() if d == "export" and r in set(cells.reporter)]
     if not imp or not exp:
@@ -1038,7 +1119,8 @@ def fig_rate_scatter(cells, conds, directions, metric, path):
     both = [cd for cd in conds if (xi.treatment == cd).any() and (xe.treatment == cd).any()]
     if not both:
         return False
-    err = RATE_SCATTER_ERROR
+    err = err or RATE_SCATTER_ERROR
+    rng = np.random.default_rng(BOOT_SEED)
     if err == "auto":
         err = "units" if all((units.treatment == cd).sum() >= 2 for cd in both) else "cells"
     cols = cond_colors(conds)
@@ -1051,6 +1133,11 @@ def fig_rate_scatter(cells, conds, directions, metric, path):
         ax.scatter(u.x, u.y, s=40, color=cols[cd], alpha=.35, lw=0, zorder=2)
         if err == "units":
             mx, my, sx, sy = u.x.mean(), u.y.mean(), u.x.std(), u.y.std()
+        elif err == "ci95":
+            de, di = xe[xe.treatment == cd], xi[xi.treatment == cd]
+            mx, my = de.v.median(), di.v.median()
+            (xlo, xhi), (ylo, yhi) = boot_median_ci(de, rng), boot_median_ci(di, rng)
+            sx, sy = [[mx - xlo], [xhi - mx]], [[my - ylo], [yhi - my]]
         else:
             ve, vi = xe[xe.treatment == cd].v, xi[xi.treatment == cd].v
             mx, my, sx, sy = ve.median(), vi.median(), ve.std(), vi.std()
@@ -1060,8 +1147,9 @@ def fig_rate_scatter(cells, conds, directions, metric, path):
     ax.set_ylim(bottom=min(0, ax.get_ylim()[0]))
     ax.set_xlabel(f"export rate, {name}{', sign reversed' if metric in RATE_COLS else ''} ({unit_label})")
     ax.set_ylabel(f"import rate, {name} ({unit_label})")
-    centre = "mean of experiment+replicate medians" if err == "units" else "median of cells"
-    ax.set_title(f"Export vs import rate: {centre} ± SD\n({imp[0]} import, {exp[0]} export; "
+    centre = {"units": "mean of experiment+replicate medians ± SD", "cells": "median of cells ± SD",
+              "ci95": f"median of cells, 95% bootstrap CI ({RATE_SCATTER_CI_RESAMPLE})"}[err]
+    ax.set_title(f"Export vs import rate: {centre}\n({imp[0]} import, {exp[0]} export; "
                  f"{'well-fit' if goodfit else 'bright'} cells; faint dots = experiment+replicate medians)",
                  loc="left", fontsize=9)
     ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.01, 1))
@@ -1171,14 +1259,28 @@ def report(cells, tr, bleach_tab, conds, control, directions, args, out):
     fig_bleach(bleach_tab, cells, conds, control, reps, directions, args, os.path.join(out, "bleach_correction.png"))
     for m in RATE_SCATTER_METRICS:
         fig_rate_scatter(cells, conds, directions, m, os.path.join(out, f"export_vs_import_{RATE_NAMES[m][2]}.png"))
+        if RATE_SCATTER_CI:
+            fig_rate_scatter(cells, conds, directions, m,
+                             os.path.join(out, f"export_vs_import_{RATE_NAMES[m][2]}_ci95.png"), err="ci95")
 
     pd.set_option("display.width", 200)
     print(summary[["reporter", "direction", "treatment", "n_bright", "pct_responders", "flux_median",
                    "flux_pct_of_control", "slope_median", "t_half_s_goodfit"]].round(2).to_string(index=False))
 
 
-def analyse(raw, meta, out, args):
-    """raw: measurements (None when REASSIGN_ONLY); meta: treatment table(s) with a source column."""
+def split_groups(cells):
+    """[(subfolder name, cells)] per combination of SPLIT_BY values; columns with one value are not split."""
+    cols = [c for c in SPLIT_BY if cells[c].nunique() > 1]
+    if not cols:
+        return [("", cells)]
+    groups = [(safe_name("_".join(map(str, k if isinstance(k, tuple) else (k,)))), g)
+              for k, g in cells.groupby(cols)]
+    return sorted(groups, key=lambda x: (first_number(x[0]), x[0]))
+
+
+def analyse(raw, meta, out, args, exclude=None):
+    """raw: measurements (None when REASSIGN_ONLY); meta: treatment table(s) with a source column;
+    exclude: {column: [values]} of cells to leave out (POOLED_EXCLUDE for the pooled run)."""
     os.makedirs(out, exist_ok=True)
     if raw is None:
         fits, traces, bleach_tab = load_cache(out)
@@ -1192,19 +1294,34 @@ def analyse(raw, meta, out, args):
     cells, tr = assign(fits, traces, meta)
     cells, tr = wrong_direction_qc(cells, tr, args, out)
     cells, tr = jump_qc(cells, tr, args, out)
-    names = list(cells.treatment.unique())
-    for set_name, spec in PLOT_SETS.items():
-        conds = select(names, spec)
-        if not conds:
-            print(f"Plot set '{set_name}': no matching treatments, skipped")
-            continue
-        control = CONTROLS.get(set_name, conds[0])
-        if control not in conds:
-            print(f"Plot set '{set_name}': control '{control}' not found; using '{conds[0]}'")
-            control = conds[0]
-        set_out = out if len(PLOT_SETS) == 1 else os.path.join(out, safe_name(set_name))
-        print(f"--- plot set '{set_name}': {', '.join(conds)} (control: {control})")
-        report(cells, tr, bleach_tab, conds, control, directions, args, set_out)
+    for col, values in (exclude or {}).items():
+        drop = cells[col].isin(values) if col in cells else pd.Series(False, index=cells.index)
+        if drop.any():
+            print(f"  Left out {drop.sum()} cells with {col} in {values}")
+            cells = cells[~drop]
+            tr = tr[tr.cell_id.isin(cells.cell_id)]
+    cells, tr = rmse_qc(cells, tr, args, out)
+    first = ["cell_id", "source", "replicate", "unit", "reporter", "direction", "treatment", "dose_mM", "image",
+             "position", "roi"] + SPLIT_BY
+    cells[first + [c for c in cells if c not in first]].to_csv(os.path.join(out, "rates_per_cell.csv"), index=False)
+    for group, gcells in split_groups(cells):
+        gtr = tr[tr.cell_id.isin(gcells.cell_id)]
+        group_out = os.path.join(out, group) if group else out
+        if group:
+            print(f"=== {group}")
+        names = list(gcells.treatment.unique())
+        for set_name, spec in PLOT_SETS.items():
+            conds = select(names, spec)
+            if not conds:
+                print(f"Plot set '{set_name}': no matching treatments, skipped")
+                continue
+            control = CONTROLS.get(set_name, conds[0])
+            if control not in conds:
+                print(f"Plot set '{set_name}': control '{control}' not found; using '{conds[0]}'")
+                control = conds[0]
+            set_out = group_out if len(PLOT_SETS) == 1 else os.path.join(group_out, safe_name(set_name))
+            print(f"--- plot set '{set_name}': {', '.join(conds)} (control: {control})")
+            report(gcells, gtr, bleach_tab, conds, control, directions, args, set_out)
 
     if SAVE_CELL_PLOTS:
         n = cell_plots(tr, cells, args, os.path.join(out, "cell_plots"))
@@ -1251,7 +1368,7 @@ def main():
                 r["Image"] = r["source"] + "/" + r["Image"]
                 pooled.append(r)
             raw = pd.concat(pooled, ignore_index=True)
-        analyse(raw, meta, out, args)
+        analyse(raw, meta, out, args, exclude=POOLED_EXCLUDE)
 
 
 if __name__ == "__main__":
