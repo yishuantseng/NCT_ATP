@@ -14,7 +14,7 @@ It needs nct_analysis.py in the same folder (plot style and statistics are share
 # PARAMETERS
 # =============================================================================
 # Folder with the analysis outputs (relative paths are next to this script).
-RESULTS_FOLDER = "nct_results_pooled"
+RESULTS_FOLDER = "nct_results_pooled/2DG"
 OUTPUT_FOLDER = "figures"            # created inside RESULTS_FOLDER
 FORMATS = ["png", "pdf"]             # one file per format
 DPI = 300
