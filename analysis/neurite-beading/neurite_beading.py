@@ -15,14 +15,18 @@ WHAT IT DOES (per image = one XY field)
      THICK_RADIUS_PX (somata, clumps, debris) and short pieces.
   3. Neurite segments: the skeleton is cut at branch points and crossings; each piece at least
      MIN_SEGMENT_LENGTH_PX long is one segment (a stretch of one neurite between crossings).
-  4. Beads: local maxima of the (smoothed) signal on the mask that are at least BEAD_FOLD x the
-     neurite shaft around them. The shaft level is the median along the skeleton in a ring
-     (BEAD_ANNULUS_PX) around the peak, so it is local and does not depend on how the network was
-     cut into segments. The bead outline is the connected area above half-way between shaft and
-     peak. Kept if at least BEAD_MIN_AREA_PX, no longer than BEAD_MAX_LENGTH_UM (longer bright
-     stretches are thick neurites or bundles), at least BEAD_MIN_SNR x noise above the shaft, and
-     not a narrow spot at a crossing (two overlapping neurites are bright too).
+  4. Beads: parts of a neurite that are at least BEAD_MIN_DIAMETER_UM wide and BEAD_FOLD x
+     brighter than the shaft around it. A grey opening with a disk of that diameter removes
+     everything narrower, so crossings of thin neurites, short bright spots and thin bright
+     stretches lose their intensity and only real swellings remain. The shaft level is the median
+     along the skeleton in rings around the bead (BEAD_RINGS_PX; the lowest ring, so a big bead
+     does not raise it). The bead outline is half-way between shaft and peak in the opened image.
+     Kept if no longer than BEAD_MAX_LENGTH_UM and BEAD_MAX_ASPECT x longer than wide (else a
+     thick stretch). Where 4 or more neurite arms meet (a crossing of thick neurites, which the
+     opening keeps), the spot must be BEAD_CROSSING_FOLD x the shaft. Large, nearly circular blobs are out-of-focus dead cells or debris: they are
+     not counted, but saved in beading_blobs.csv and drawn in blue in the overlays.
      Each bead is assigned to the segment it sits on (for the segment-level table).
+     (Criteria tuned on beads, dead cells and non-beads the user marked in 20261015_MN_92.)
 
 BEADING METRICS
   beads_per_100um      number of beads per 100 um of neurite (skeleton) length   <- main readout
@@ -36,7 +40,8 @@ OUTPUTS (in <experiment>/OUTPUT_SUBFOLDER; with several folders, POOLED_OUTPUT g
          tables and plots, one big dot per experiment + replicate)
   beading_segments.csv     one row per segment: image, treatment, length, n beads, metrics
   beading_beads.csv        one row per bead: position, area, length, width, peak / shaft
-  beading_images.csv       one row per image: pooled metrics, total length, blobs removed
+  beading_blobs.csv        round blobs left out (out-of-focus dead cells / debris)
+  beading_images.csv       one row per image: pooled metrics, total length, n round blobs
   summary_by_treatment.csv per treatment: n images / segments, medians of each metric
   stats_vs_control.csv     Mann-Whitney U of each treatment vs its control (image and segment level)
   superplot_images.png     image-level metrics (faint dots = images), big dots = experiment+replicate
@@ -106,20 +111,24 @@ SEGMENT_MAX_DIST_PX = 12                      # mask pixels further than this fr
 
 # --- Bead detection ----------------------------------------------------------
 BEAD_SIGMA = 1.0                              # Gaussian blur (px) of the summed signal for bead detection
-BEAD_FOLD = 2.0                               # bead peak >= BEAD_FOLD x the shaft around it
-BEAD_ANNULUS_PX = (8, 22)                     # shaft = median along the skeleton in this ring (px) around
-                                              # the peak (inner radius > bead radius; 22 px ~ 4 um)
-BEAD_MIN_SHAFT_PX = 8                         # need at least this many skeleton pixels in the ring
+BEAD_MIN_DIAMETER_UM = 1.5                    # a bead is at least this wide (grey-opening disk); narrower
+                                              # bright spots (crossings, bright stretches) are not beads
+BEAD_FOLD = 1.5                               # the bead (after the opening) is >= BEAD_FOLD x the shaft
+BEAD_RINGS_PX = [(8, 22), (16, 32), (25, 40)] # shaft = median along the skeleton in a ring around the
+                                              # bead; the lowest of these rings is used (big beads fill
+                                              # the inner ring)
+BEAD_MIN_SHAFT_PX = 8                         # a ring needs at least this many skeleton pixels
+BEAD_WINDOW_PX = 45                           # search window radius around a bead (px)
 BEAD_PEAK_SEP_PX = 3                          # peaks closer than this are one candidate
-BEAD_MIN_AREA_PX = 6                          # smallest bead (px), outline = half-way between shaft and peak
-BEAD_MAX_LENGTH_UM = 5.0                      # longest bead (major axis); longer = thick stretch, not a bead
-BEAD_MIN_SNR = 5.0                            # bead peak must be this many noise SDs above the shaft
-JUNCTION_EXCLUDE_PX = 6                       # a bright spot this close to a crossing / branch point is
-                                              # taken as overlapping neurites unless it is wide (below);
-                                              # a crossing is where >= 3 kept segments meet (the short
-                                              # spurs a bead adds to the skeleton do not count)
-JUNCTION_MERGE_PX = 5                         # skeleton nodes this close are merged into one crossing
-BEAD_MIN_WIDTH_AT_CROSSING_UM = 1.5           # wider spots at a crossing still count as beads
+BEAD_MIN_AREA_PX = 20                         # smallest bead (px)
+BEAD_MAX_LENGTH_UM = 8.0                      # longest bead (major axis)
+BEAD_MAX_ASPECT = 3.0                         # longer / wider than this = a thick stretch, not a bead
+BEAD_CROSSING_FOLD = 2.5                      # where >= 4 neurite arms meet (a crossing), the bead must be
+                                              # this many x brighter than the shaft
+BEAD_MIN_SNR = 5.0                            # bead must be this many noise SDs above the shaft
+ROUND_BLOB_MAX_ASPECT = 1.25                  # nearly circular and ...
+ROUND_BLOB_MIN_WIDTH_UM = 2.0                 # ... at least this wide = out-of-focus dead cell or debris,
+                                              # not counted (saved in beading_blobs.csv, blue in overlays)
 PIXEL_SIZE_UM = 0.183333                      # used if the TIFF has no OME pixel size
 
 # --- Plots -------------------------------------------------------------------
@@ -142,7 +151,7 @@ import pandas as pd
 import tifffile
 from scipy import ndimage as ndi
 from scipy.stats import mannwhitneyu
-from skimage import filters, morphology, measure, segmentation
+from skimage import filters, morphology, measure
 
 import matplotlib
 matplotlib.use("Agg")
@@ -216,8 +225,7 @@ def segments(mask):
     skel = morphology.skeletonize(mask)
     nb = ndi.convolve(skel.astype(int), np.ones((3, 3), int), mode="constant") - 1
     junction = skel & (nb >= 3)
-    junction_zone = ndi.binary_dilation(junction, morphology.disk(2))
-    branches = skel & ~junction_zone
+    branches = skel & ~ndi.binary_dilation(junction, morphology.disk(2))
     lab = measure.label(branches, connectivity=2)
     lengths = np.bincount(lab.ravel(), minlength=lab.max() + 1)
     lengths[0] = 0
@@ -225,65 +233,84 @@ def segments(mask):
     dist, (iy, ix) = ndi.distance_transform_edt(lab == 0, return_indices=True)
     seg = lab[iy, ix]
     seg[~mask | (dist > SEGMENT_MAX_DIST_PX)] = 0
-    # real crossings / branch points: junction zones touched by >= 3 kept segments
-    # (nodes closer than 2 x JUNCTION_MERGE_PX are one crossing: an X skeletonises into two nodes)
-    zlab = measure.label(ndi.binary_dilation(junction, morphology.disk(JUNCTION_MERGE_PX)))
-    grown = segmentation.expand_labels(zlab, 2)
-    both = (grown > 0) & (lab > 0)
-    pairs = np.unique(np.stack([grown[both], lab[both]]), axis=1)
-    n_touch = np.bincount(pairs[0], minlength=zlab.max() + 1)
-    crossing = (n_touch >= 3)[zlab] & (zlab > 0)
-    return seg, lab, lengths, crossing, skel
+    return seg, lab, lengths, skel
 
 
-def find_beads(smooth, mask, skel, seg, crossing, sd, um):
-    """Beads = local maxima of the signal that are BEAD_FOLD x brighter than the neurite shaft
-    around them (median along the skeleton in an annulus), grown to their half-maximum outline."""
-    peaks = (smooth == ndi.maximum_filter(smooth, size=2 * BEAD_PEAK_SEP_PX + 1)) & mask
-    near_crossing = ndi.distance_transform_edt(~crossing) <= JUNCTION_EXCLUDE_PX
-    r_in, r_out = BEAD_ANNULUS_PX
-    yy, xx = np.mgrid[-r_out:r_out + 1, -r_out:r_out + 1]
-    rr = np.hypot(yy, xx)
-    ring = (rr >= r_in) & (rr <= r_out)
-    disk = rr <= r_out
+def find_beads(smooth, full, skel, seg, sd, um):
+    """Beads = parts of a neurite that are wider than BEAD_MIN_DIAMETER_UM and BEAD_FOLD x brighter
+    than the shaft around them. A grey opening with a disk of that diameter removes everything
+    narrower (thin shafts, crossings of thin neurites, short bright spots), so only wide swellings
+    keep their intensity. Returns the beads, their mask and the round blobs left out (dead cells)."""
+    r_open = max(1, int(round(BEAD_MIN_DIAMETER_UM / um / 2)))
+    opened = ndi.grey_opening(smooth, footprint=morphology.disk(r_open))
+    score = opened + 1e-3 * smooth                      # break ties on the flat tops the opening makes
+    peaks = (score == ndi.maximum_filter(score, size=2 * BEAD_PEAK_SEP_PX + 1)) & full
+    peaks &= opened > BEAD_MIN_SNR * sd
+    W = BEAD_WINDOW_PX
     h, w = smooth.shape
-    pad = r_out
-    sm_p = np.pad(smooth, pad, constant_values=0)
-    sk_p = np.pad(skel, pad, constant_values=False)
-    mk_p = np.pad(mask, pad, constant_values=False)
+    op_p = np.pad(opened, W)
+    sm_p = np.pad(smooth, W)
+    sk_p = np.pad(skel, W)
+    fu_p = np.pad(full, W)
+    yy, xx = np.mgrid[-W:W + 1, -W:W + 1]
+    rr = np.hypot(yy, xx)
+    rings = [(rr >= a) & (rr <= b) for a, b in BEAD_RINGS_PX]
     bead_mask = np.zeros(smooth.shape, bool)
-    beads = []
-    for py, px in sorted(zip(*np.nonzero(peaks)), key=lambda t: -smooth[t]):
-        if bead_mask[py, px]:
+    blob_mask = np.zeros(smooth.shape, bool)
+    beads, blobs = [], []
+    for py, px in sorted(zip(*np.nonzero(peaks)), key=lambda t: -opened[t]):
+        if bead_mask[py, px] or blob_mask[py, px]:
             continue
-        win = (slice(py, py + 2 * pad + 1), slice(px, px + 2 * pad + 1))
-        shaft = sm_p[win][ring & sk_p[win]]
-        if shaft.size < BEAD_MIN_SHAFT_PX:
+        win = (slice(py, py + 2 * W + 1), slice(px, px + 2 * W + 1))
+        K = sk_p[win]
+        Sw = sm_p[win]
+        # shaft level: median of the smoothed signal along the skeleton in rings around the peak;
+        # the lowest ring is used so that a big bead filling the inner ring does not raise it
+        vals = []
+        for ring in rings:
+            sel = ring & K
+            if sel.sum() >= BEAD_MIN_SHAFT_PX:
+                vals.append(np.median(Sw[sel]))
+        if not vals:
             continue
-        base = np.median(shaft)
-        peak = smooth[py, px]
+        base = min(vals)
+        peak = opened[py, px]
         if base <= 0 or peak < BEAD_FOLD * base or peak - base < BEAD_MIN_SNR * sd:
             continue
-        # outline: connected pixels above half-way between shaft and peak, within r_out
-        region = (sm_p[win] >= base + 0.5 * (peak - base)) & mk_p[win] & disk
+        region = (op_p[win] >= base + 0.5 * (peak - base)) & fu_p[win] & (rr < W - 1)
         lab = measure.label(region)
-        region = lab == lab[pad, pad]
-        if region[0, :].any() or region[-1, :].any() or region[:, 0].any() or region[:, -1].any():
+        region = lab == lab[W, W]
+        if rr[region].max() >= W - 2:
             continue                                    # runs out of the window: a thick stretch
         props = measure.regionprops(region.astype(int))[0]
         length, width = props.axis_major_length * um, props.axis_minor_length * um
-        if props.area < BEAD_MIN_AREA_PX or length > BEAD_MAX_LENGTH_UM:
+        aspect = props.axis_major_length / max(props.axis_minor_length, 1)
+        if props.area < BEAD_MIN_AREA_PX or length > BEAD_MAX_LENGTH_UM or aspect > BEAD_MAX_ASPECT:
             continue
-        if near_crossing[py, px] and width < BEAD_MIN_WIDTH_AT_CROSSING_UM:
-            continue                                    # two neurites overlapping, not a bead
+        # a crossing of two thick neurites survives the opening: >= 4 skeleton arms leave the bead
+        # and two overlapping shafts are ~2x one shaft, so a crossing must be clearly brighter
+        r_bead = rr[region].max()
+        near = ndi.binary_dilation(region, iterations=2)
+        sub = K & (rr <= r_bead + 10) & ~near
+        lab_s = measure.label(sub, connectivity=2)
+        touching = np.unique(lab_s[ndi.binary_dilation(near, iterations=2) & sub])
+        reach = ndi.maximum(rr, lab_s, touching[touching > 0]) if (touching > 0).any() else []
+        arms = int(np.sum(np.asarray(reach) >= r_bead + 6))   # arms leaving the bead, >= 4 px long
+        if arms >= 4 and peak < BEAD_CROSSING_FOLD * base:
+            continue
         ys, xs = np.nonzero(region)
-        ys, xs = ys + py - pad, xs + px - pad
+        ys, xs = ys + py - W, xs + px - W
         ok = (ys >= 0) & (ys < h) & (xs >= 0) & (xs < w)
+        row = {"segment": int(seg[py, px]), "x": int(px), "y": int(py), "area_px": int(props.area),
+               "area_um2": props.area * um * um, "length_um": length, "width_um": width,
+               "aspect": aspect, "arms": int(arms), "peak": peak, "shaft": base, "peak_over_shaft": peak / base}
+        if aspect < ROUND_BLOB_MAX_ASPECT and width >= ROUND_BLOB_MIN_WIDTH_UM:
+            blobs.append(row)                           # round and large: out-of-focus dead cell / debris
+            blob_mask[ys[ok], xs[ok]] = True
+            continue
         bead_mask[ys[ok], xs[ok]] = True
-        beads.append({"segment": int(seg[py, px]), "x": int(px), "y": int(py), "area_px": int(props.area),
-                      "area_um2": props.area * um * um, "length_um": length, "width_um": width,
-                      "peak": peak, "shaft": base, "peak_over_shaft": peak / base})
-    return beads, bead_mask
+        beads.append(row)
+    return beads, bead_mask, blobs, blob_mask
 
 
 def process_image(paths, overlay_path=None):
@@ -292,10 +319,11 @@ def process_image(paths, overlay_path=None):
     raw = sum(imgs)
     um = pixel_size_um(paths[0])
     mask, thick = neurite_mask(total)
-    seg, branch_lab, lengths, crossing, skel = segments(mask)
+    seg, branch_lab, lengths, skel = segments(mask)
     smooth = ndi.gaussian_filter(total, BEAD_SIGMA)
     sd = noise_sd(smooth, mask | thick)
-    beads, bead_mask = find_beads(smooth, mask, skel, seg, crossing, sd, um)
+    full = mask | (thick & (smooth > MIN_SNR * sd))     # big beads can sit in the blobs cut from the mask
+    beads, bead_mask, blobs, blob_mask = find_beads(smooth, full, skel, seg, sd, um)
     ids = np.unique(branch_lab[branch_lab > 0])
     baseline = np.zeros(branch_lab.max() + 1)
     if len(ids):
@@ -319,7 +347,6 @@ def process_image(paths, overlay_path=None):
             "x": float(np.nonzero(on_skel)[1].mean()), "y": float(np.nonzero(on_skel)[0].mean()),
         })
     total_len = sum(r["length_um"] for r in rows)
-    blobs = measure.label(thick & (total > MIN_SNR * sd))
     info = {
         "total_length_um": total_len, "n_segments": len(rows), "n_beads": len(beads),
         "beads_per_100um": 100 * len(beads) / total_len if total_len else np.nan,
@@ -328,14 +355,14 @@ def process_image(paths, overlay_path=None):
                         if rows else np.nan,
         "bead_area_um2_median": np.median([b["area_um2"] for b in beads]) if beads else np.nan,
         "mask_fraction": mask.mean(), "noise_sd": sd,
-        "n_large_blobs": int(blobs.max()), "large_blob_fraction": thick.mean(),
+        "n_round_blobs": len(blobs), "large_blob_fraction": thick.mean(),
     }
     if overlay_path:
-        save_overlay(raw, mask, bead_mask, beads, overlay_path, info)
-    return info, rows, beads
+        save_overlay(raw, mask, bead_mask, blob_mask, beads, overlay_path, info)
+    return info, rows, beads, blobs
 
 
-def save_overlay(raw, mask, bead_mask, beads, path, info):
+def save_overlay(raw, mask, bead_mask, blob_mask, beads, path, info):
     fig, ax = plt.subplots(1, 2, figsize=(10, 7.5))
     lo, hi = np.percentile(raw, [1, 99.7])
     for a in ax:
@@ -344,6 +371,8 @@ def save_overlay(raw, mask, bead_mask, beads, path, info):
     ax[0].contour(mask, levels=[0.5], colors="yellow", linewidths=0.3)
     ax[0].set_title("neurite mask", fontsize=9)
     ax[1].contour(bead_mask, levels=[0.5], colors="red", linewidths=0.5)
+    if blob_mask.any():
+        ax[1].contour(blob_mask, levels=[0.5], colors="deepskyblue", linewidths=0.5)
     ax[1].set_title(f"{len(beads)} beads, {info['beads_per_100um']:.1f} per 100 µm, "
                     f"{100 * info['bead_area_fraction']:.1f}% of area", fontsize=9)
     fig.suptitle(os.path.basename(path)[:-4], fontsize=9)
@@ -380,7 +409,7 @@ def run_experiment(folder):
     first = CHANNEL_SUFFIXES[0]
     files = sorted(f for f in os.listdir(img_dir) if f.startswith(FILE_PREFIX) and f.endswith(first))
     print(f"{name}: {len(files)} images")
-    seg_rows, img_rows, bead_rows = [], [], []
+    seg_rows, img_rows, bead_rows, blob_rows = [], [], [], []
     for f in files:
         base = f[: -len(first)]
         paths = [os.path.join(img_dir, base + s) for s in CHANNEL_SUFFIXES]
@@ -402,16 +431,18 @@ def run_experiment(folder):
                          "replicate": DEFAULT_REPLICATE})
         meta["condition"] = condition_label(meta["treatment"], meta["treat_time"], meta["recovery"])
         ov = os.path.join(out, "overlays", base + ".png") if SAVE_OVERLAYS else None
-        info, rows, beads = process_image(paths, ov)
+        info, rows, beads, blobs = process_image(paths, ov)
         img_rows.append({**meta, **info})
         seg_rows += [{**meta, **r} for r in rows]
         bead_rows += [{**meta, **b} for b in beads]
+        blob_rows += [{**meta, **b} for b in blobs]
         print(f"  {base}: {info['n_segments']} segments, {info['n_beads']} beads, "
               f"{info['beads_per_100um']:.2f} per 100 um")
     segs, imgs, beads = pd.DataFrame(seg_rows), pd.DataFrame(img_rows), pd.DataFrame(bead_rows)
     segs.to_csv(os.path.join(out, "beading_segments.csv"), index=False)
     imgs.to_csv(os.path.join(out, "beading_images.csv"), index=False)
     beads.to_csv(os.path.join(out, "beading_beads.csv"), index=False)
+    pd.DataFrame(blob_rows).to_csv(os.path.join(out, "beading_blobs.csv"), index=False)
     write_summary_and_plots(segs, imgs, out)
     return segs, imgs, beads
 

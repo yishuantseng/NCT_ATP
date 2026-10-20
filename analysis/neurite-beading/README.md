@@ -17,9 +17,15 @@ Outputs go to `<experiment>/analysis/neurite_beading/`.
    the cytosol, so the sum follows neurite volume and does not depend on the ATP/ADP ratio.
 2. Neurite mask and segments as in `neurite_atp.py` (ridge filter, threshold, skeleton cut at
    crossings). Blobs wider than ~5.5 µm (cell bodies, clumps) are removed.
-3. Beads are local maxima at least `BEAD_FOLD` (2x) brighter than the neurite shaft around them
-   (median along the skeleton in a 1.5–4 µm ring), outlined at half-way between shaft and peak,
-   at most 5 µm long, and not a narrow bright spot at a crossing (overlapping neurites).
+3. Beads are parts of a neurite at least 1.5 µm wide (a grey opening with a 1.5 µm disk removes
+   anything narrower: thin shafts, crossings of thin neurites, short bright spots) and at least
+   1.5x brighter than the shaft around them (median along the skeleton in rings around the bead).
+   They must be at most 8 µm long and at most 3x longer than wide (else a thick stretch). Where
+   4 or more neurite arms meet (a crossing of thick neurites), the spot must be 2.5x the shaft.
+4. Large, nearly circular blobs (aspect < 1.25, ≥ 2 µm) are taken as out-of-focus dead cells or
+   debris and are not counted; they are listed in `beading_blobs.csv` and drawn blue in overlays.
+
+The criteria were tuned on beads, dead cells and non-beads marked by hand in 20261015_MN_92.
 
 ## Metrics
 
